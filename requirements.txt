@@ -1,0 +1,18 @@
+# Database
+psycopg2-binary
+sqlalchemy
+pgvector
+# Embeddings & ML
+sentence-transformers
+numpy
+torch
+
+# Data Processing
+pandas
+
+# Configuration
+python-dotenv
+
+# Development Tools (optional)
+# jupyterlab
+# ipykernel
