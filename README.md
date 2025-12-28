@@ -8,16 +8,23 @@ I am not actually connecting or licensing to Splunk here. It is a splunk-alterna
 - performs analytics and anomaly detection (like Splunk but AI-powered)
 
 ## Requirements
-postgres
+- PostGreSQL
+- Python
+- Pip
+- Python packages listed in [requirements.txt](requirements.txt)
 
 
-## Installation instructions
+## Dependencies Installation instructions
 ```bash
+# install dependencies
+pip install -r requirements.txt
+
+# install PostGreSQL
 brew install postgresql@15
-psql --version
+psql --version # check version
 ```
 
-### Installing PG Vector
+## Installing PG Vector
 ```bash
 psql postgres
 
@@ -60,7 +67,7 @@ ls /opt/homebrew/opt/postgresql@15/share/postgresql@15/extension/vector*
 ```
 
 ## Create database
-- The database schema is located in the [Schemas file](./config/schemas.md)
+The `log_analytics` database schema is located in the [Schemas file](./config/schemas.md)
 ```bash
 # create the database from schema
 psql -d log_analytics -f ./config/schemas.md
@@ -68,6 +75,96 @@ psql -d log_analytics -f ./config/schemas.md
 # verify whether it worked
 psql -d log_analytics -f ./config/schemas.md
 ```
+
+## Create Indices
+Indexes help in quickly searching across the database. The indexing strategy here works similar to a yellow pages book. 
+
+For my use cases, it's likely that the users will search based on timestamps, log levels and of course, the actual message itself. I need the following indices:-
+1. `idx_logs_timestamp` - for time-range queries (recent logs, date filters)
+2. `idx_logs_level` - for filtering by severity (`ERROR`, `WARN`, etc.)
+3. `idx_logs_embedding` - `HNSW` index for fast vector similarity search
+Without these, your semantic search will be slow. The `HNSW` index is critical - it makes vector search logarithmic instead of linear. 
+
+I have stored them in [indices.sql](./config/indices.sql)
+```sql
+psql -d log_analytics -f config/indices.sql
+
+# verify:
+psql -d log_analytics -c "\d logs"
+```
+
+### Database Schema
+```sql
+LLM_Splunk_Logs $ psql postgres
+psql (15.15 (Homebrew))
+Type "help" for help.
+
+postgres=# \c log_analytics
+You are now connected to database "log_analytics" as user "saikamat".
+log_analytics=#
+log_analytics=# \d logs
+                                      Table "public.logs"
+  Column   |           Type           | Collation | Nullable |             Default
+-----------+--------------------------+-----------+----------+----------------------------------
+ id        | integer                  |           | not null | nextval('logs_id_seq'::regclass)
+ timestamp | timestamp with time zone |           | not null |
+ level     | character varying(20)    |           |          |
+ source    | character varying(255)   |           |          |
+ message   | text                     |           | not null |
+ metadata  | jsonb                    |           |          |
+ embedding | vector(384)              |           |          |
+Indexes:
+    "logs_pkey" PRIMARY KEY, btree (id)
+    "idx_logs_embedding" hnsw (embedding vector_cosine_ops)
+    "idx_logs_level" btree (level)
+    "idx_logs_timestamp" btree ("timestamp" DESC)
+
+```
+
+
+
+## Generate logs
+```bash
+python -m src.data_pipeline.etl
+```
+### The `log_analytics` Database
+```sql
+log_analytics=# SELECT id, timestamp, level, source, message, metadata FROM logs ORDER BY timestamp DESC;
+ id  |           timestamp           | level |   source   |             message             |                  metadata
+-----+-------------------------------+-------+------------+---------------------------------+--------------------------------------------
+  83 | 2025-12-28 20:25:48.998731+01 | INFO  | nginx      | Bad gateway                     | {"status": "500"}
+  38 | 2025-12-28 20:10:19.861907+01 | INFO  | postgresql | Query timeout                   | {"database": "cache"}
+  78 | 2025-12-28 19:32:42.812705+01 | ERROR | systemd    | Service started                 | {"service": "postgresql"}
+  12 | 2025-12-28 14:47:07.429288+01 | ERROR | auth       | Authentication failed           | {"ip": "192.168.1.104", "user": "eve"}
+  18 | 2025-12-28 14:34:07.429288+01 | WARN  | systemd    | Configuration file updated      | {"service": "postgresql"}
+ 107 | 2025-12-28 14:20:00.95468+01  | INFO  | nginx      | Request processed               | {"status": "503"}
+ 116 | 2025-12-28 12:41:06.250545+01 | INFO  | nginx      | Request processed               | {"status": "200"}
+  22 | 2025-12-28 10:56:13.85222+01  | INFO  | postgresql | Database connection established | {"database": "cache"}
+  79 | 2025-12-28 09:13:42.812705+01 | INFO  | kernel     | Disk space running low          | {"pid": 1, "process": "systemd"}
+ 130 | 2025-12-28 09:03:36.827905+01 | WARN  | cron       | Schedule updated                | {"job": "cleanup"}
+ 125 | 2025-12-28 08:57:36.827905+01 | INFO  | nginx      | Bad gateway                     | {"status": "503"}
+ 119 | 2025-12-28 05:37:06.250545+01 | WARN  | networking | Packet loss detected            | {"interface": "eth0"}
+  24 | 2025-12-28 03:33:13.85222+01  | INFO  | sshd       | User login failed               | {"ip": "192.168.1.102", "user": "charlie"}
+  92 | 2025-12-28 02:47:54.614504+01 | INFO  | docker     | Image pulled                    | {"container": "web"}
+  50 | 2025-12-28 02:13:25.761353+01 | ERROR | sshd       | User login failed               | {"ip": "192.168.1.101", "user": "bob"}
+  98 | 2025-12-28 01:26:54.614504+01 | WARN  | networking | DNS resolution failed           | {"interface": "eth0"}
+  48 | 2025-12-27 23:43:25.761353+01 | WARN  | cron       | Job executed                    | {"job": "backup"}
+  81 | 2025-12-27 23:33:48.998731+01 | INFO  | sshd       | User login successful           | {"ip": "192.168.1.100", "user": "alice"}
+  51 | 2025-12-27 20:29:31.290008+01 | INFO  | cron       | Job executed                    | {"job": "backup"}
+  36 | 2025-12-27 18:21:19.861907+01 | WARN  | postgresql | Database connection established | {"database": "cache"}
+  29 | 2025-12-27 16:37:13.85222+01  | INFO  | auth       | User login successful           | {"ip": "192.168.1.104", "user": "eve"}
+ 115 | 2025-12-27 15:15:06.250545+01 | INFO  | networking | DNS resolution failed           | {"interface": "eth1"}
+  75 | 2025-12-27 14:12:42.812705+01 | WARN  | docker     | Image pulled                    | {"container": "web"}
+  30 | 2025-12-27 10:50:13.85222+01  | INFO  | docker     | Container stopped               | {"container": "web"}
+  23 | 2025-12-27 09:51:13.85222+01  | WARN  | sshd       | User login failed               | {"ip": "192.168.1.100", "user": "alice"}
+```
+
+## Search logs using natural questions
+```bash
+python -m src.data_pipeline.search
+```
+
+
 
 ## Project Structure
 - `/src` separates code from `config/docs/tests/`
@@ -78,6 +175,13 @@ psql -d log_analytics -f ./config/schemas.md
 - `data/raw` for raw log files & `/data/processed` for processed log files
 - scales well when adding services
 
+## Motivation for PostGreSQL
+- Main reason -> pgvector extension
+- we store vector embeddings (384-dimensional arrays) for semantic search
+- PostGreSQL has a pgvector extension that:-
+    - stores vectors natively as a data type: `VECTOR`
+    - has efficient similarity search algorithms (HNSW, IVFFlat)
+    - can index millions of vectors for fast nearest-neighbour search
 
 ## Vector Embedding
 - it's a way to convert text (like a log message) into a list of numbers that captures its meaning
@@ -100,12 +204,4 @@ Finds logs with similar embeddings:
 - `Invalid password attempt` → [0.22, -0.38, 0.85, ...]
 - `Auth token expired` → [0.26, -0.41, 0.88, ...]
 When embeddings are close in vector space => similar meaning
-
-## Motivation for PostGreSQL
-- Main reason -> pgvector extension
-- we store vector embeddings (384-dimensional arrays) for semantic search
-- PostGreSQL has a pgvector extension that:-
-    - stores vectors natively as a data type: `VECTOR`
-    - has efficient similarity search algorithms (HNSW, IVFFlat)
-    - can index millions of vectors for fast nearest-neighbour search
 
