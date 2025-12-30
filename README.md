@@ -163,6 +163,18 @@ log_analytics=# SELECT id, timestamp, level, source, message, metadata FROM logs
 ```bash
 python -m src.data_pipeline.search
 ```
+### Output of search results:-
+```bash
+(venv_llm_logs) LLM_Splunk_Logs $ python -m src.data_pipeline.search
+
+Search results for => what were login related issues yesterday?
+
+(50, datetime.datetime(2025, 12, 28, 2, 13, 25, 761353, tzinfo=datetime.timezone(datetime.timedelta(seconds=3600))), 'ERROR', 'sshd', 'User login failed', {'ip': '192.168.1.101', 'user': 'bob'}, 0.408474326133728)
+(23, datetime.datetime(2025, 12, 27, 9, 51, 13, 852220, tzinfo=datetime.timezone(datetime.timedelta(seconds=3600))), 'WARN', 'sshd', 'User login failed', {'ip': '192.168.1.100', 'user': 'alice'}, 0.408474326133728)
+(127, datetime.datetime(2025, 12, 25, 6, 4, 36, 827905, tzinfo=datetime.timezone(datetime.timedelta(seconds=3600))), 'INFO', 'sshd', 'User login failed', {'ip': '192.168.1.100', 'user': 'alice'}, 0.408474326133728)
+(105, datetime.datetime(2025, 12, 26, 2, 48, 0, 954680, tzinfo=datetime.timezone(datetime.timedelta(seconds=3600))), 'INFO', 'sshd', 'User login failed', {'ip': '192.168.1.100', 'user': 'alice'}, 0.408474326133728)
+(102, datetime.datetime(2025, 12, 22, 23, 56, 0, 954680, tzinfo=datetime.timezone(datetime.timedelta(seconds=3600))), 'WARN', 'sshd', 'User login failed', {'ip': '192.168.1.102', 'user': 'charlie'}, 0.408474326133728)
+```
 
 
 

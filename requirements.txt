@@ -2,10 +2,15 @@
 psycopg2-binary
 sqlalchemy
 pgvector
+
 # Embeddings & ML
 sentence-transformers
 numpy
 torch
+
+# AWS Bedrock & LLM
+boto3>=1.34.0
+sqlparse>=0.4.4
 
 # Data Processing
 pandas
