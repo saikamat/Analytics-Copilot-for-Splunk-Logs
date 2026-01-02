@@ -18,6 +18,18 @@ pandas
 # Configuration
 python-dotenv
 
+# Web Framework
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+python-multipart
+
+# Testing
+pytest
+pytest-asyncio
+httpx
+
 # Development Tools (optional)
 # jupyterlab
 # ipykernel
