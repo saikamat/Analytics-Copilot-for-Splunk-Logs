@@ -87,8 +87,9 @@ app.add_middleware(
 logger.info(f"CORS enabled for origins: {settings.get_cors_origins()}")
 
 
-# Routes will be included here after Issue #3
-# Example: app.include_router(router, prefix="/api")
+# Include API routes
+from src.backend.routes import router
+app.include_router(router, prefix="/api", tags=["API"])
 
 
 @app.get("/", tags=["Root"])
