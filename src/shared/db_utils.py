@@ -8,8 +8,8 @@ validated SQL queries against PostgreSQL.
 Classes:
     DatabaseConnectionPool: Manages PostgreSQL connections with pooling
     QueryExecutor: Executes SQL queries with security guardrails
-    ResultFormatter: Formats query results (future)
-    QueryResult: Structured query response (future)
+    ResultFormatter: Formats query results with type conversion
+    QueryResult: Immutable structured query response (dataclass)
 
 Exceptions:
     DatabaseError: Base exception for database operations
@@ -21,7 +21,10 @@ Exceptions:
 
 import os
 import logging
-from typing import Optional
+import json
+from typing import Optional, List, Dict, Any
+from dataclasses import dataclass
+from datetime import datetime
 from dotenv import load_dotenv
 from psycopg2 import pool
 from psycopg2.pool import PoolError
@@ -61,6 +64,53 @@ class QueryTimeoutError(DatabaseError):
 class ResultFormattingError(DatabaseError):
     """Failed to format results (type conversion error)."""
     pass
+
+
+# ============================================================================
+# QueryResult Dataclass
+# ============================================================================
+
+@dataclass(frozen=True)
+class QueryResult:
+    """
+    Immutable structured response from query execution.
+
+    This dataclass encapsulates query results with metadata for API responses,
+    caching, and result analysis. The frozen=True parameter ensures immutability,
+    preventing accidental modification of query results.
+
+    Attributes:
+        success: True if query executed successfully, False on error
+        rows: Results as list of dicts with column names as keys
+        row_count: Number of rows returned (length of rows list)
+        column_names: List of column names from SELECT statement
+        execution_time_ms: Query execution time in milliseconds
+        truncated: True if results exceeded max_rows limit
+        error_message: Error details if success=False, None otherwise
+
+    Example:
+        >>> result = QueryResult(
+        ...     success=True,
+        ...     rows=[
+        ...         {"id": 1, "timestamp": "2025-12-28T20:25:48+01:00", "level": "ERROR"},
+        ...         {"id": 2, "timestamp": "2025-12-28T19:32:42+01:00", "level": "ERROR"}
+        ...     ],
+        ...     row_count=2,
+        ...     column_names=["id", "timestamp", "level"],
+        ...     execution_time_ms=45.2,
+        ...     truncated=False,
+        ...     error_message=None
+        ... )
+        >>> print(f"Found {result.row_count} errors in {result.execution_time_ms}ms")
+        Found 2 errors in 45.2ms
+    """
+    success: bool
+    rows: List[Dict[str, Any]]
+    row_count: int
+    column_names: List[str]
+    execution_time_ms: float
+    truncated: bool = False
+    error_message: Optional[str] = None
 
 
 # ============================================================================
@@ -301,7 +351,7 @@ class QueryExecutor:
         sql: str,
         timeout: int = 30,
         max_rows: int = 10000
-    ) -> dict:
+    ) -> QueryResult:
         """
         Execute SQL query with security guardrails and performance tracking.
 
@@ -316,25 +366,28 @@ class QueryExecutor:
             max_rows: Maximum rows to return (default: 10,000)
 
         Returns:
-            dict with keys:
-                - rows: List of tuples containing query results
+            QueryResult with:
+                - success: True if query executed successfully
+                - rows: List of dicts with column names as keys (type-converted)
                 - column_names: List of column names from cursor.description
                 - execution_time_ms: Query execution time in milliseconds
                 - truncated: True if results exceeded max_rows
                 - row_count: Number of rows returned
+                - error_message: None on success, error details on failure
 
         Raises:
             ConnectionPoolError: If connection cannot be acquired (retries once)
             QueryExecutionError: If SQL execution fails
             QueryTimeoutError: If query exceeds timeout limit
+            ResultFormattingError: If result formatting fails catastrophically
 
         Example:
             >>> executor = QueryExecutor(pool)
             >>> result = executor.execute_query(
             ...     "SELECT * FROM logs WHERE level = 'ERROR' ORDER BY timestamp DESC LIMIT 100"
             ... )
-            >>> for row in result['rows']:
-            ...     print(row)
+            >>> for row in result.rows:
+            ...     print(row['timestamp'], row['message'])
         """
         import time
 
@@ -403,13 +456,13 @@ class QueryExecutor:
                 f"{execution_time_ms:.2f}ms, truncated={truncated}"
             )
 
-            return {
-                "rows": rows,
-                "column_names": column_names,
-                "execution_time_ms": round(execution_time_ms, 2),
-                "truncated": truncated,
-                "row_count": len(rows)
-            }
+            # Format results with type conversion
+            return ResultFormatter.format_results(
+                rows=rows,
+                column_names=column_names,
+                execution_time_ms=execution_time_ms,
+                truncated=truncated
+            )
 
         except QueryTimeoutError:
             # Re-raise timeout errors without wrapping
@@ -446,6 +499,160 @@ class QueryExecutor:
                     self.pool.return_connection(conn)
                 except:
                     pass  # Ignore return connection errors
+
+
+# ============================================================================
+# ResultFormatter
+# ============================================================================
+
+class ResultFormatter:
+    """
+    Formats query results with type conversion for API responses.
+
+    Converts raw PostgreSQL tuples into structured dicts with proper type
+    handling for datetime, JSONB, numpy arrays, and NULL values. Implements
+    graceful error handling to prevent type conversion failures from breaking
+    query execution.
+
+    Type Conversions:
+        - datetime.datetime → ISO 8601 string (e.g., "2025-12-28T20:25:48+01:00")
+        - JSONB (str/dict) → dict via json.loads()
+        - numpy.ndarray → list via .tolist()
+        - NULL (None) → None (preserved)
+        - Unknown types → str(value) with warning logged
+
+    Example:
+        >>> raw_rows = [(1, datetime.now(), 'ERROR', '{"status": "500"}')]
+        >>> column_names = ['id', 'timestamp', 'level', 'metadata']
+        >>> result = ResultFormatter.format_results(
+        ...     raw_rows, column_names, 45.2, False
+        ... )
+        >>> print(result.rows[0]['timestamp'])
+        "2025-12-28T20:25:48+01:00"
+    """
+
+    @staticmethod
+    def _convert_value(value: Any, column_name: str) -> Any:
+        """
+        Convert a single value to JSON-serializable type.
+
+        Args:
+            value: Value to convert (can be any PostgreSQL type)
+            column_name: Column name for error logging
+
+        Returns:
+            JSON-serializable value (str, int, float, bool, dict, list, None)
+
+        Note:
+            On conversion error, logs warning and returns str(value) as fallback.
+        """
+        # NULL values
+        if value is None:
+            return None
+
+        # datetime → ISO 8601 string
+        if isinstance(value, datetime):
+            try:
+                return value.isoformat()
+            except Exception as e:
+                logger.warning(
+                    f"Failed to convert datetime to ISO 8601 for column '{column_name}': {e}. "
+                    f"Using str() fallback."
+                )
+                return str(value)
+
+        # JSONB → dict
+        # PostgreSQL JSONB can be returned as dict or str depending on driver/query
+        if isinstance(value, str):
+            # Try parsing as JSON if it looks like JSON
+            if value.strip().startswith(('{', '[')):
+                try:
+                    return json.loads(value)
+                except json.JSONDecodeError:
+                    # Not valid JSON, return as-is
+                    return value
+            return value
+        elif isinstance(value, dict):
+            # Already a dict (JSONB returned as dict)
+            return value
+
+        # numpy.ndarray → list (for vector columns)
+        if hasattr(value, 'tolist'):
+            try:
+                return value.tolist()
+            except Exception as e:
+                logger.warning(
+                    f"Failed to convert array to list for column '{column_name}': {e}. "
+                    f"Using str() fallback."
+                )
+                return str(value)
+
+        # Primitives (int, float, bool, str) - pass through
+        if isinstance(value, (int, float, bool, str)):
+            return value
+
+        # Unknown type - convert to string with warning
+        logger.warning(
+            f"Unknown type {type(value).__name__} for column '{column_name}'. "
+            f"Converting to string."
+        )
+        return str(value)
+
+    @staticmethod
+    def format_results(
+        rows: List[tuple],
+        column_names: List[str],
+        execution_time_ms: float,
+        truncated: bool
+    ) -> QueryResult:
+        """
+        Format raw query results into structured QueryResult.
+
+        Args:
+            rows: Raw tuples from cursor.fetchmany()
+            column_names: Column names from cursor.description
+            execution_time_ms: Query execution time in milliseconds
+            truncated: True if results exceeded max_rows limit
+
+        Returns:
+            QueryResult with type-converted rows and metadata
+
+        Raises:
+            ResultFormattingError: Only on catastrophic formatting failure
+                                   (individual type conversion errors are logged but don't fail)
+
+        Example:
+            >>> raw_rows = [(1, '2025-12-28', 'ERROR')]
+            >>> column_names = ['id', 'timestamp', 'level']
+            >>> result = ResultFormatter.format_results(raw_rows, column_names, 12.5, False)
+            >>> result.rows[0]
+            {'id': 1, 'timestamp': '2025-12-28', 'level': 'ERROR'}
+        """
+        try:
+            # Convert list of tuples to list of dicts
+            formatted_rows = []
+            for row in rows:
+                row_dict = {}
+                for i, column_name in enumerate(column_names):
+                    value = row[i] if i < len(row) else None
+                    row_dict[column_name] = ResultFormatter._convert_value(value, column_name)
+                formatted_rows.append(row_dict)
+
+            # Create immutable QueryResult
+            return QueryResult(
+                success=True,
+                rows=formatted_rows,
+                row_count=len(formatted_rows),
+                column_names=column_names,
+                execution_time_ms=round(execution_time_ms, 2),
+                truncated=truncated,
+                error_message=None
+            )
+
+        except Exception as e:
+            # Catastrophic formatting failure
+            logger.error(f"Failed to format query results: {str(e)}")
+            raise ResultFormattingError(f"Failed to format results: {str(e)}")
 
 
 # ============================================================================

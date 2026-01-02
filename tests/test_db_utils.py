@@ -3,20 +3,27 @@ Unit and integration tests for database utilities (db_utils.py).
 
 Tests cover:
 - DatabaseConnectionPool: Connection management, pooling, health checks
-- QueryExecutor: SQL execution with security (future)
-- ResultFormatter: Type conversions (future)
+- QueryExecutor: SQL execution with security
+- ResultFormatter: Type conversions
+- QueryResult: Immutable result dataclass
 """
 
 import pytest
 import os
+import json
+from datetime import datetime
 from unittest.mock import Mock, patch, MagicMock
 from psycopg2.pool import PoolError
+import numpy as np
 from src.shared.db_utils import (
     DatabaseConnectionPool,
     QueryExecutor,
+    ResultFormatter,
+    QueryResult,
     ConnectionPoolError,
     QueryExecutionError,
     QueryTimeoutError,
+    ResultFormattingError,
     DatabaseError
 )
 
@@ -232,15 +239,16 @@ class TestQueryExecutorUnit:
                 assert any("SET TRANSACTION READ ONLY" in str(call) for call in calls)
                 assert any("SET statement_timeout" in str(call) for call in calls)
 
-                # Verify result structure
-                assert result["rows"] == [
-                    (1, "2025-12-28 10:00:00", "ERROR", "Test error 1"),
-                    (2, "2025-12-28 11:00:00", "ERROR", "Test error 2")
-                ]
-                assert result["column_names"] == ["id", "timestamp", "level", "message"]
-                assert result["row_count"] == 2
-                assert result["truncated"] is False
-                assert "execution_time_ms" in result
+                # Verify result structure (now QueryResult object)
+                assert isinstance(result, QueryResult)
+                assert result.row_count == 2
+                assert result.column_names == ["id", "timestamp", "level", "message"]
+                assert result.truncated is False
+                assert result.execution_time_ms > 0
+                # Rows are now list of dicts
+                assert len(result.rows) == 2
+                assert result.rows[0]["id"] == 1
+                assert result.rows[0]["level"] == "ERROR"
 
     def test_execute_query_with_truncation(self):
         """Test query execution with result truncation."""
@@ -261,10 +269,11 @@ class TestQueryExecutorUnit:
                 # Execute with max_rows=5
                 result = executor.execute_query("SELECT * FROM logs", max_rows=5)
 
-                # Verify truncation
-                assert result["truncated"] is True
-                assert result["row_count"] == 5
-                assert len(result["rows"]) == 5
+                # Verify truncation (now QueryResult object)
+                assert isinstance(result, QueryResult)
+                assert result.truncated is True
+                assert result.row_count == 5
+                assert len(result.rows) == 5
 
     def test_execute_query_timeout(self):
         """Test query timeout handling."""
@@ -341,7 +350,7 @@ class TestQueryExecutorUnit:
 
                 # Should succeed after retry
                 result = executor.execute_query("SELECT * FROM logs LIMIT 1")
-                assert result["row_count"] == 1
+                assert result.row_count == 1
 
     def test_execute_query_connection_retry_failure(self):
         """Test connection retry failure after second attempt."""
@@ -407,9 +416,163 @@ class TestQueryExecutorUnit:
 
                 result = executor.execute_query("SELECT * FROM logs WHERE 1=0")
 
-                assert result["rows"] == []
-                assert result["row_count"] == 0
-                assert result["truncated"] is False
+                assert isinstance(result, QueryResult)
+                assert result.rows == []
+                assert result.row_count == 0
+                assert result.truncated is False
+
+
+# ============================================================================
+# Unit Tests: ResultFormatter (Type Conversions)
+# ============================================================================
+
+class TestResultFormatterUnit:
+    """Unit tests for ResultFormatter type conversions."""
+
+    def test_convert_value_null(self):
+        """Test NULL (None) values are preserved."""
+        result = ResultFormatter._convert_value(None, "test_column")
+        assert result is None
+
+    def test_convert_value_datetime(self):
+        """Test datetime → ISO 8601 string conversion."""
+        dt = datetime(2025, 12, 28, 20, 25, 48)
+        result = ResultFormatter._convert_value(dt, "timestamp")
+        assert result == "2025-12-28T20:25:48"
+        assert isinstance(result, str)
+
+    def test_convert_value_jsonb_dict(self):
+        """Test JSONB dict is preserved."""
+        metadata = {"status": "500", "user": "alice"}
+        result = ResultFormatter._convert_value(metadata, "metadata")
+        assert result == metadata
+        assert isinstance(result, dict)
+
+    def test_convert_value_jsonb_string(self):
+        """Test JSONB string → dict conversion."""
+        json_str = '{"status": "500", "user": "alice"}'
+        result = ResultFormatter._convert_value(json_str, "metadata")
+        assert result == {"status": "500", "user": "alice"}
+        assert isinstance(result, dict)
+
+    def test_convert_value_jsonb_malformed(self):
+        """Test malformed JSON returns as-is string."""
+        bad_json = '{"incomplete": '
+        result = ResultFormatter._convert_value(bad_json, "metadata")
+        assert result == bad_json
+        assert isinstance(result, str)
+
+    def test_convert_value_numpy_array(self):
+        """Test numpy.ndarray → list conversion."""
+        arr = np.array([0.1, 0.2, 0.3, 0.4])
+        result = ResultFormatter._convert_value(arr, "embedding")
+        assert result == [0.1, 0.2, 0.3, 0.4]
+        assert isinstance(result, list)
+
+    def test_convert_value_primitives(self):
+        """Test primitive types (int, float, bool, str) pass through."""
+        assert ResultFormatter._convert_value(42, "id") == 42
+        assert ResultFormatter._convert_value(3.14, "score") == 3.14
+        assert ResultFormatter._convert_value(True, "is_active") == True
+        assert ResultFormatter._convert_value("text", "message") == "text"
+
+    def test_convert_value_unknown_type(self):
+        """Test unknown types convert to string with warning."""
+        class CustomType:
+            def __str__(self):
+                return "custom_value"
+
+        custom = CustomType()
+        result = ResultFormatter._convert_value(custom, "custom_column")
+        assert result == "custom_value"
+        assert isinstance(result, str)
+
+    def test_format_results_basic(self):
+        """Test basic result formatting."""
+        raw_rows = [
+            (1, "ERROR", "Test message"),
+            (2, "INFO", "Another message")
+        ]
+        column_names = ["id", "level", "message"]
+
+        result = ResultFormatter.format_results(raw_rows, column_names, 12.5, False)
+
+        assert isinstance(result, QueryResult)
+        assert result.success is True
+        assert result.row_count == 2
+        assert result.column_names == ["id", "level", "message"]
+        assert result.execution_time_ms == 12.5
+        assert result.truncated is False
+        assert result.error_message is None
+
+        # Check rows are dicts
+        assert result.rows[0] == {"id": 1, "level": "ERROR", "message": "Test message"}
+        assert result.rows[1] == {"id": 2, "level": "INFO", "message": "Another message"}
+
+    def test_format_results_with_datetime(self):
+        """Test result formatting with datetime conversion."""
+        dt = datetime(2025, 12, 28, 20, 25, 48)
+        raw_rows = [(1, dt, "ERROR")]
+        column_names = ["id", "timestamp", "level"]
+
+        result = ResultFormatter.format_results(raw_rows, column_names, 10.0, False)
+
+        assert result.rows[0]["timestamp"] == "2025-12-28T20:25:48"
+
+    def test_format_results_with_jsonb(self):
+        """Test result formatting with JSONB conversion."""
+        raw_rows = [(1, '{"status": "500"}')]
+        column_names = ["id", "metadata"]
+
+        result = ResultFormatter.format_results(raw_rows, column_names, 10.0, False)
+
+        assert result.rows[0]["metadata"] == {"status": "500"}
+
+    def test_format_results_with_null(self):
+        """Test result formatting with NULL values."""
+        raw_rows = [(1, None, "ERROR")]
+        column_names = ["id", "metadata", "level"]
+
+        result = ResultFormatter.format_results(raw_rows, column_names, 10.0, False)
+
+        assert result.rows[0]["metadata"] is None
+
+    def test_format_results_truncated(self):
+        """Test result formatting with truncation flag."""
+        raw_rows = [(i,) for i in range(10)]
+        column_names = ["id"]
+
+        result = ResultFormatter.format_results(raw_rows, column_names, 15.0, True)
+
+        assert result.truncated is True
+        assert result.row_count == 10
+
+    def test_format_results_empty(self):
+        """Test result formatting with empty results."""
+        raw_rows = []
+        column_names = ["id", "level", "message"]
+
+        result = ResultFormatter.format_results(raw_rows, column_names, 5.0, False)
+
+        assert result.success is True
+        assert result.row_count == 0
+        assert result.rows == []
+        assert result.truncated is False
+
+    def test_query_result_immutable(self):
+        """Test QueryResult is immutable (frozen=True)."""
+        result = QueryResult(
+            success=True,
+            rows=[{"id": 1}],
+            row_count=1,
+            column_names=["id"],
+            execution_time_ms=10.0,
+            truncated=False
+        )
+
+        # Attempt to modify should raise FrozenInstanceError
+        with pytest.raises(Exception):  # dataclasses.FrozenInstanceError
+            result.row_count = 999
 
 
 # ============================================================================
@@ -536,21 +699,22 @@ class TestQueryExecutorIntegration:
             "SELECT id, timestamp, level, source, message FROM logs LIMIT 5"
         )
 
-        # Verify result structure
-        assert "rows" in result
-        assert "column_names" in result
-        assert "execution_time_ms" in result
-        assert "truncated" in result
-        assert "row_count" in result
+        # Verify result structure (now QueryResult object)
+        assert isinstance(result, QueryResult)
+        assert result.success is True
+        assert result.execution_time_ms > 0
+        assert result.row_count <= 5
+        assert result.truncated is False
 
         # Verify column names
-        assert "id" in result["column_names"]
-        assert "timestamp" in result["column_names"]
-        assert "level" in result["column_names"]
+        assert "id" in result.column_names
+        assert "timestamp" in result.column_names
+        assert "level" in result.column_names
 
-        # Verify results
-        assert result["row_count"] <= 5
-        assert result["truncated"] is False
+        # Verify rows are dicts
+        assert len(result.rows) == result.row_count
+        if result.row_count > 0:
+            assert isinstance(result.rows[0], dict)
 
     def test_execute_query_with_where_clause(self, pool):
         """Test query with WHERE clause."""
@@ -561,9 +725,9 @@ class TestQueryExecutorIntegration:
         )
 
         # All returned rows should be ERROR level
-        for row in result["rows"]:
-            # row format: (id, level, message)
-            assert row[1] == "ERROR"
+        # Rows are now dicts with column names as keys
+        for row in result.rows:
+            assert row["level"] == "ERROR"
 
     def test_execute_query_aggregation(self, pool):
         """Test aggregation query."""
@@ -574,9 +738,10 @@ class TestQueryExecutorIntegration:
         )
 
         # Verify result structure
-        assert result["row_count"] >= 0
-        assert "level" in result["column_names"]
-        assert "count" in result["column_names"]
+        assert isinstance(result, QueryResult)
+        assert result.row_count >= 0
+        assert "level" in result.column_names
+        assert "count" in result.column_names
 
     def test_execute_query_order_by(self, pool):
         """Test query with ORDER BY."""
@@ -586,13 +751,15 @@ class TestQueryExecutorIntegration:
             "SELECT id, timestamp FROM logs ORDER BY timestamp DESC LIMIT 3"
         )
 
-        assert result["row_count"] <= 3
+        assert isinstance(result, QueryResult)
+        assert result.row_count <= 3
 
         # Verify timestamps are in descending order
-        if result["row_count"] >= 2:
-            for i in range(result["row_count"] - 1):
-                # Timestamps should be descending
-                assert result["rows"][i][1] >= result["rows"][i + 1][1]
+        # Rows are now dicts with timestamp converted to ISO string
+        if result.row_count >= 2:
+            for i in range(result.row_count - 1):
+                # Timestamps should be descending (ISO strings compare correctly)
+                assert result.rows[i]["timestamp"] >= result.rows[i + 1]["timestamp"]
 
     def test_execute_query_truncation_real_db(self, pool):
         """Test result truncation with real database."""
@@ -605,11 +772,12 @@ class TestQueryExecutorIntegration:
         )
 
         # Should be truncated if logs table has > 5 rows
-        if result["row_count"] == 5:
+        assert isinstance(result, QueryResult)
+        if result.row_count == 5:
             # If we got 5 rows and there are more in the database, truncated should be True
             # We can't guarantee this without knowing the table size, so just verify structure
-            assert isinstance(result["truncated"], bool)
-            assert result["row_count"] == 5
+            assert isinstance(result.truncated, bool)
+            assert result.row_count == 5
 
     def test_execute_query_empty_result_real_db(self, pool):
         """Test query with no results."""
@@ -619,9 +787,10 @@ class TestQueryExecutorIntegration:
             "SELECT * FROM logs WHERE id = -999999"
         )
 
-        assert result["rows"] == []
-        assert result["row_count"] == 0
-        assert result["truncated"] is False
+        assert isinstance(result, QueryResult)
+        assert result.rows == []
+        assert result.row_count == 0
+        assert result.truncated is False
 
     def test_execute_query_metadata_jsonb(self, pool):
         """Test query accessing JSONB metadata field."""
@@ -631,10 +800,13 @@ class TestQueryExecutorIntegration:
             "SELECT id, metadata FROM logs WHERE metadata IS NOT NULL LIMIT 3"
         )
 
-        # Verify we can access metadata
-        assert result["row_count"] <= 3
-        if result["row_count"] > 0:
-            assert "metadata" in result["column_names"]
+        # Verify we can access metadata (now dict in rows)
+        assert isinstance(result, QueryResult)
+        assert result.row_count <= 3
+        if result.row_count > 0:
+            assert "metadata" in result.column_names
+            # Metadata should be a dict (converted from JSONB)
+            assert isinstance(result.rows[0]["metadata"], dict)
 
     def test_read_only_enforcement_real_db(self, pool):
         """Test that read-only transaction prevents writes."""
@@ -654,9 +826,9 @@ class TestQueryExecutorIntegration:
         result = executor.execute_query("SELECT 1")
 
         # Execution time should be tracked and reasonable
-        assert "execution_time_ms" in result
-        assert result["execution_time_ms"] > 0
-        assert result["execution_time_ms"] < 1000  # Should complete in < 1 second
+        assert isinstance(result, QueryResult)
+        assert result.execution_time_ms > 0
+        assert result.execution_time_ms < 1000  # Should complete in < 1 second
 
 
 # ============================================================================
