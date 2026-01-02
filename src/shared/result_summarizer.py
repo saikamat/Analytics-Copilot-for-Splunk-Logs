@@ -7,28 +7,31 @@ summaries for system administrators and DevOps engineers.
 
 Classes:
     BedrockResultSummarizer: Generates natural language summaries from QueryResult objects
+    SummaryResult: Immutable dataclass containing summary text, success flag, model ID, and execution time
 
 Exceptions:
     BedrockError: Inherited from bedrock_client for API errors
 
 Usage Example:
-    >>> from src.shared.result_summarizer import BedrockResultSummarizer
+    >>> from src.shared.result_summarizer import BedrockResultSummarizer, SummaryResult
     >>> from src.shared.db_utils import QueryResult
     >>>
     >>> summarizer = BedrockResultSummarizer()
-    >>> summary = summarizer.generate_summary(
+    >>> summary_result = summarizer.summarize(
     ...     original_query="show me errors from yesterday",
     ...     sql_query="SELECT * FROM logs WHERE level = 'ERROR'...",
     ...     result=query_result_object
     ... )
-    >>> print(summary)
+    >>> print(summary_result.summary)
     "Found 47 errors in the last 24 hours affecting multiple services..."
+    >>> print(f"Success: {summary_result.success}, Model: {summary_result.model_id}")
 """
 
 import boto3
 import json
 import os
 import time
+from dataclasses import dataclass
 from dotenv import load_dotenv
 from botocore.exceptions import ClientError
 
@@ -37,6 +40,35 @@ from src.shared.bedrock_client import BedrockError  # Reuse exception
 
 # Load environment variables
 load_dotenv()
+
+
+@dataclass(frozen=True)
+class SummaryResult:
+    """
+    Immutable result from summarization operation.
+
+    Attributes:
+        summary (str): The natural language summary text
+        success (bool): Whether summarization succeeded
+        model_id (str): Bedrock model ID used for summarization
+        execution_time_ms (float): Time taken for summarization in milliseconds
+        error_message (str | None): Error message if summarization failed
+
+    Examples:
+        >>> result = SummaryResult(
+        ...     summary="Found 47 errors in the last 24 hours...",
+        ...     success=True,
+        ...     model_id="anthropic.claude-haiku-4-5-20251001-v1:0",
+        ...     execution_time_ms=1234.5
+        ... )
+        >>> print(result.summary)
+        "Found 47 errors in the last 24 hours..."
+    """
+    summary: str
+    success: bool
+    model_id: str
+    execution_time_ms: float
+    error_message: str = None
 
 
 class BedrockResultSummarizer:
@@ -399,12 +431,12 @@ Retrieved maximum 10,000 INFO logs from the past week (results truncated). Logs 
             except Exception as e:
                 raise BedrockError(f"Unexpected error during Bedrock invocation: {str(e)}")
 
-    def generate_summary(
+    def summarize(
         self,
         original_query: str,
         sql_query: str,
         result: QueryResult
-    ) -> str:
+    ) -> SummaryResult:
         """
         Generate natural language summary of query results.
 
@@ -412,7 +444,7 @@ Retrieved maximum 10,000 INFO logs from the past week (results truncated). Logs 
         1. Validates input QueryResult
         2. Builds context from query metadata and results
         3. Invokes AWS Bedrock Claude with few-shot prompt
-        4. Extracts and returns summary text
+        4. Extracts and returns summary in SummaryResult dataclass
 
         Uses temperature 0.3 for slight creativity in phrasing while maintaining
         consistency. Targets 2-4 sentence summaries with specific numbers and insights.
@@ -423,29 +455,33 @@ Retrieved maximum 10,000 INFO logs from the past week (results truncated). Logs 
             result: QueryResult object from QueryExecutor containing rows, metadata, etc.
 
         Returns:
-            Natural language summary (2-4 sentences) highlighting key insights
+            SummaryResult with summary text, success flag, model ID, and execution time
 
         Raises:
-            BedrockError: If Bedrock API fails after retries
             ValueError: If inputs are invalid
 
         Examples:
             >>> summarizer = BedrockResultSummarizer()
             >>> result = QueryResult(success=True, rows=[...], row_count=47, ...)
-            >>> summary = summarizer.generate_summary(
+            >>> summary_result = summarizer.summarize(
             ...     "show errors from yesterday",
             ...     "SELECT * FROM logs WHERE level='ERROR'...",
             ...     result
             ... )
-            >>> print(summary)
+            >>> print(summary_result.summary)
             "Found 47 errors in the last 24 hours affecting multiple services..."
+            >>> print(f"Success: {summary_result.success}, Time: {summary_result.execution_time_ms}ms")
 
         Edge Cases:
             - Empty results (0 rows): Returns constructive explanation
             - Single row: Provides detailed summary of that log entry
             - Large results (truncated): Summarizes preview + advises narrowing query
-            - Failed query: Returns error message from QueryResult
+            - Failed query: Returns fallback summary with success=False
+            - Bedrock API errors: Returns fallback summary with success=False
         """
+        # Start timing
+        start_time = time.time()
+
         # Validate inputs
         if not original_query or not original_query.strip():
             raise ValueError("Original query cannot be empty")
@@ -456,10 +492,17 @@ Retrieved maximum 10,000 INFO logs from the past week (results truncated). Logs 
         if result is None:
             raise ValueError("QueryResult cannot be None")
 
-        # Handle failed queries
+        # Handle failed queries with fallback summary
         if not result.success:
             error_msg = result.error_message or "Unknown error"
-            return f"Query failed: {error_msg}"
+            execution_time_ms = (time.time() - start_time) * 1000
+            return SummaryResult(
+                summary=f"Query failed: {error_msg}",
+                success=False,
+                model_id=self.model_id,
+                execution_time_ms=execution_time_ms,
+                error_message=error_msg
+            )
 
         # Build prompt
         context = self._build_summary_context(original_query, sql_query, result)
@@ -489,23 +532,64 @@ Retrieved maximum 10,000 INFO logs from the past week (results truncated). Logs 
 
         try:
             response_body = self._retry_with_backoff(invoke)
-        except BedrockError:
-            # Re-raise BedrockError as-is
-            raise
+        except BedrockError as e:
+            # Fallback summary on Bedrock errors
+            execution_time_ms = (time.time() - start_time) * 1000
+            fallback_summary = (
+                f"Query returned {result.row_count} rows in {result.execution_time_ms:.1f}ms. "
+                f"Summary generation failed due to API error."
+            )
+            return SummaryResult(
+                summary=fallback_summary,
+                success=False,
+                model_id=self.model_id,
+                execution_time_ms=execution_time_ms,
+                error_message=str(e)
+            )
         except Exception as e:
             # Fallback summary on unexpected errors
-            return (
+            execution_time_ms = (time.time() - start_time) * 1000
+            fallback_summary = (
                 f"Query returned {result.row_count} rows in {result.execution_time_ms:.1f}ms. "
                 f"Summary generation unavailable due to error: {str(e)}"
+            )
+            return SummaryResult(
+                summary=fallback_summary,
+                success=False,
+                model_id=self.model_id,
+                execution_time_ms=execution_time_ms,
+                error_message=str(e)
             )
 
         # Extract summary from response
         try:
             summary = response_body['content'][0]['text'].strip()
         except (KeyError, IndexError) as e:
-            raise BedrockError(f"Unexpected response format from Bedrock: {str(e)}")
+            # Fallback on malformed response
+            execution_time_ms = (time.time() - start_time) * 1000
+            error_msg = f"Unexpected response format from Bedrock: {str(e)}"
+            fallback_summary = (
+                f"Query returned {result.row_count} rows in {result.execution_time_ms:.1f}ms. "
+                f"Summary generation failed due to response parsing error."
+            )
+            return SummaryResult(
+                summary=fallback_summary,
+                success=False,
+                model_id=self.model_id,
+                execution_time_ms=execution_time_ms,
+                error_message=error_msg
+            )
 
-        return summary
+        # Calculate execution time
+        execution_time_ms = (time.time() - start_time) * 1000
+
+        # Return successful result
+        return SummaryResult(
+            summary=summary,
+            success=True,
+            model_id=self.model_id,
+            execution_time_ms=execution_time_ms
+        )
 
 
 # Testing entry point
@@ -593,30 +677,39 @@ if __name__ == "__main__":
 
         # Test Case 1
         print("Query: 'show me errors from yesterday'")
-        summary_1 = summarizer.generate_summary(
+        result_1 = summarizer.summarize(
             original_query="show me errors from yesterday",
             sql_query="SELECT * FROM logs WHERE level = 'ERROR' AND timestamp >= NOW() - INTERVAL '1 day'",
             result=test_result_1
         )
-        print(f"Summary: {summary_1}\n")
+        print(f"Summary: {result_1.summary}")
+        print(f"Success: {result_1.success}")
+        print(f"Model: {result_1.model_id}")
+        print(f"Execution Time: {result_1.execution_time_ms:.1f}ms\n")
 
         # Test Case 2
         print("Query: 'show kernel panics from yesterday'")
-        summary_2 = summarizer.generate_summary(
+        result_2 = summarizer.summarize(
             original_query="show kernel panics from yesterday",
             sql_query="SELECT * FROM logs WHERE source = 'kernel' AND message ILIKE '%panic%'",
             result=test_result_2
         )
-        print(f"Summary: {summary_2}\n")
+        print(f"Summary: {result_2.summary}")
+        print(f"Success: {result_2.success}")
+        print(f"Model: {result_2.model_id}")
+        print(f"Execution Time: {result_2.execution_time_ms:.1f}ms\n")
 
         # Test Case 3
         print("Query: 'count errors by service'")
-        summary_3 = summarizer.generate_summary(
+        result_3 = summarizer.summarize(
             original_query="count errors by service",
             sql_query="SELECT source, COUNT(*) as error_count FROM logs WHERE level = 'ERROR' GROUP BY source",
             result=test_result_3
         )
-        print(f"Summary: {summary_3}\n")
+        print(f"Summary: {result_3.summary}")
+        print(f"Success: {result_3.success}")
+        print(f"Model: {result_3.model_id}")
+        print(f"Execution Time: {result_3.execution_time_ms:.1f}ms\n")
 
         print("=" * 80)
         print("All tests completed successfully!")
