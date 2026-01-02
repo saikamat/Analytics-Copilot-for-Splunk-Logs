@@ -7,20 +7,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This is an **AI-powered log analytics system** - a Splunk alternative that uses:
 - **PostgreSQL with pgvector** for storage and semantic search
 - **Sentence-transformers** to convert log messages into 384-dimensional embeddings
-- **LLMs** (future phases) to translate natural language queries into SQL
+- **LLMs (AWS Bedrock Claude)** to translate natural language queries into SQL
+- **FastAPI** for REST API backend
 - **Python** for ETL pipeline and backend services
 
 The project follows a **4-phase development approach**:
 1. **Phase 1** (Complete): Foundation & Data Pipeline
-2. **Phase 2** (In Progress): LLM Integration for natural language queries
+2. **Phase 2** (Almost Complete): LLM Integration for natural language queries
+   - ✅ 2a: AWS Bedrock SQL Generator
+   - ✅ 2b: Database Utilities (connection pooling, query execution)
+   - ✅ 2c: FastAPI Backend (REST API endpoints)
+   - ⏳ 2d: Result Summarization (LLM-based summaries)
 3. **Phase 3**: Intelligence Layer (anomaly detection, runbooks)
 4. **Phase 4**: Web App & AWS Deployment
 
 ## Architecture
 
 ### Data Flow
+
+**Data Ingestion**:
 ```
-Log Generation → ETL Pipeline → PostgreSQL → Semantic Search
+Log Generation → ETL Pipeline → PostgreSQL (with embeddings)
 ```
 
 1. **Log Generation** (`data/log_generator.py`): Creates synthetic system logs from 9 services (sshd, nginx, kernel, etc.) with realistic metadata
@@ -30,7 +37,16 @@ Log Generation → ETL Pipeline → PostgreSQL → Semantic Search
    - Serializes metadata dicts to JSON
    - Batch inserts using `psycopg2.extras.execute_batch`
 3. **Storage**: PostgreSQL `logs` table with VECTOR(384) column
-4. **Search**: Vector similarity using pgvector's cosine distance operator (`<=>`)
+
+**Query Pipeline**:
+```
+HTTP Request → FastAPI → BedrockSQLGenerator → QueryExecutor → PostgreSQL → Results
+```
+
+1. **HTTP API** (`src/backend/app.py`): FastAPI REST API with Pydantic validation
+2. **NL→SQL Translation** (`src/shared/bedrock_client.py`): Claude translates natural language to SQL
+3. **SQL Execution** (`src/shared/db_utils.py`): QueryExecutor with security and timeouts
+4. **Database**: PostgreSQL with pgvector for semantic search using `<=>` operator
 
 ### Database Schema
 
@@ -525,12 +541,13 @@ The project includes comprehensive test coverage for all database utilities and 
 
 ### Test Organization
 
-**Location**: `/tests` directory with three main files:
+**Location**: `/tests` directory with four main files:
 - `conftest.py`: Pytest fixtures for test database setup/teardown and fixture data
 - `test_db_utils.py`: Unit and integration tests for database utilities (52 tests)
 - `test_integration_e2e.py`: End-to-end integration tests (18 tests)
+- `test_api.py`: FastAPI integration tests (11 tests)
 
-**Total Test Count**: 70 tests covering unit, integration, and end-to-end scenarios
+**Total Test Count**: 81 tests covering unit, integration, end-to-end, and API scenarios
 
 ### Running Tests
 
@@ -538,12 +555,13 @@ The project includes comprehensive test coverage for all database utilities and 
 # Activate virtual environment first
 source venv_llm_logs/bin/activate
 
-# Run all tests
+# Run ALL tests (database utilities + API integration)
 python -m pytest tests/ -v
 
 # Run specific test file
-python -m pytest tests/test_db_utils.py -v
-python -m pytest tests/test_integration_e2e.py -v
+python -m pytest tests/test_db_utils.py -v        # 52 database utility tests
+python -m pytest tests/test_integration_e2e.py -v  # 18 end-to-end tests
+python -m pytest tests/test_api.py -v             # 11 API integration tests
 
 # Run with short traceback (cleaner output)
 python -m pytest tests/ -v --tb=short
@@ -551,6 +569,8 @@ python -m pytest tests/ -v --tb=short
 # Run specific test class or method
 python -m pytest tests/test_integration_e2e.py::TestEndToEndFlow::test_end_to_end_with_bedrock -v
 ```
+
+**Total Test Coverage**: 81 tests (52 database utilities + 18 end-to-end + 11 API)
 
 ### Test Database Setup
 
@@ -639,6 +659,231 @@ When adding new database functionality:
 3. **Update fixture data** in `conftest.py` if new scenarios require specific test data
 4. **Run full test suite** to verify no regressions: `pytest tests/ -v`
 
+## FastAPI Backend
+
+**Location**: `src/backend/`
+
+Provides a REST API for natural language log queries. Integrates BedrockSQLGenerator and QueryExecutor to expose HTTP endpoints for web/mobile applications.
+
+### Architecture
+
+```
+HTTP POST /api/query
+{"query": "show errors from yesterday", "max_rows": 100}
+    ↓
+FastAPI Request Validation (Pydantic)
+    ↓
+BedrockSQLGenerator.generate_sql(query)
+    ↓ Validated SQL
+QueryExecutor.execute_query(sql, timeout, max_rows)
+    ↓ QueryResult
+FastAPI Response (JSON)
+    ↓
+HTTP 200 OK
+{"success": true, "rows": [...], "row_count": 15, "execution_time_ms": 1567.3}
+```
+
+### Core Components
+
+**`src/backend/app.py`** - FastAPI application setup:
+- Lifespan context manager for connection pool lifecycle
+- CORS middleware configuration
+- Automatic API documentation at `/docs` (Swagger) and `/redoc`
+
+**`src/backend/routes.py`** - API endpoints:
+- `POST /api/query`: Execute natural language queries
+- `GET /api/health`: Database health check
+
+**`src/backend/models.py`** - Pydantic request/response models:
+- `QueryRequest`: Validates query (1-500 chars), max_rows (1-50,000), timeout (1-300s)
+- `QueryResponse`: Structured results with rows, row_count, execution_time_ms, truncated flag
+- `ErrorResponse`: Consistent error format with success=false, error message, error_type
+
+**`src/backend/config.py`** - Configuration from environment variables using Pydantic Settings
+
+### Running the Server
+
+```bash
+# Activate virtual environment first
+source venv_llm_logs/bin/activate
+
+# Development mode (hot reload)
+uvicorn src.backend.app:app --reload --host 0.0.0.0 --port 8000
+
+# Production mode (multi-worker)
+uvicorn src.backend.app:app --host 0.0.0.0 --port 8000 --workers 9 --log-level info
+```
+
+**Server URLs**:
+- API: http://localhost:8000
+- Swagger UI: http://localhost:8000/docs
+- ReDoc: http://localhost:8000/redoc
+
+### API Endpoints
+
+#### POST /api/query
+
+Execute a natural language query against logs.
+
+**Request**:
+```bash
+curl -X POST http://localhost:8000/api/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "show me nginx errors from yesterday",
+    "max_rows": 100,
+    "timeout": 30
+  }'
+```
+
+**Response (200 OK)**:
+```json
+{
+  "success": true,
+  "rows": [
+    {
+      "id": 42,
+      "timestamp": "2025-12-28T14:30:00+01:00",
+      "level": "ERROR",
+      "source": "nginx",
+      "message": "Connection timeout",
+      "metadata": {"status_code": "500"}
+    }
+  ],
+  "row_count": 15,
+  "column_names": ["id", "timestamp", "level", "source", "message", "metadata"],
+  "execution_time_ms": 1567.3,
+  "truncated": false,
+  "sql_query": "SELECT * FROM logs WHERE level = 'ERROR' ..."
+}
+```
+
+**Error Responses**:
+
+| HTTP Status | Error Type | Description |
+|-------------|------------|-------------|
+| 400 | ValidationError | SQL validation failed (dangerous operation blocked) |
+| 400 | QueryExecutionError | SQL execution error (syntax, invalid column) |
+| 408 | QueryTimeoutError | Query exceeded timeout limit |
+| 422 | Pydantic | Invalid request parameters |
+| 502 | BedrockError | AWS Bedrock API error |
+| 503 | ConnectionPoolError | Database unavailable |
+
+#### GET /api/health
+
+Check API health and dependencies.
+
+**Request**:
+```bash
+curl http://localhost:8000/api/health
+```
+
+**Response (200 OK)**:
+```json
+{
+  "status": "healthy",
+  "database_connected": true,
+  "bedrock_available": true
+}
+```
+
+### Configuration
+
+**Environment Variables** (`.env`):
+```bash
+# FastAPI
+FASTAPI_HOST="0.0.0.0"
+FASTAPI_PORT=8000
+FASTAPI_LOG_LEVEL="info"
+
+# CORS (comma-separated origins)
+CORS_ORIGINS="http://localhost:3000,http://localhost:8080"
+
+# Query Limits
+DEFAULT_TIMEOUT=30
+MAX_TIMEOUT=300
+DEFAULT_MAX_ROWS=10000
+MAX_MAX_ROWS=50000
+```
+
+**Pydantic Settings**: Add `extra = "ignore"` to Config class to allow unknown environment variables (like AWS credentials).
+
+### Security
+
+The API implements 8 layers of security:
+1. Input Validation (Pydantic)
+2. SQL Validation (BedrockSQLGenerator)
+3. Read-Only Transaction (QueryExecutor)
+4. Query Timeout (QueryExecutor)
+5. Result Limits (QueryExecutor)
+6. Connection Pool Limits (DatabaseConnectionPool)
+7. CORS Policy (FastAPI Middleware)
+8. Error Sanitization (no SQL in error messages)
+
+### Testing
+
+**API Integration Tests** (`tests/test_api.py` - 11 tests):
+
+```bash
+# Run all API tests
+python -m pytest tests/test_api.py -v
+
+# Run with short traceback
+python -m pytest tests/test_api.py -v --tb=short
+```
+
+**Test Coverage**:
+- Root endpoint (API info)
+- Health check endpoint
+- Query endpoint with mocked Bedrock
+- Empty query validation (422)
+- Dangerous SQL blocking (400)
+- Bedrock error handling (502)
+- Query length validation (422)
+- Invalid max_rows/timeout validation (422)
+- Response structure verification
+- Error response consistency
+
+**Key Testing Pattern**: Use TestClient with context manager to trigger lifespan events:
+
+```python
+@pytest.fixture(scope="module")
+def test_client():
+    """Create TestClient with lifespan context."""
+    with TestClient(app) as client:
+        yield client
+```
+
+This ensures `db_pool` and `query_executor` are initialized properly.
+
+### Performance
+
+| Metric | Target |
+|--------|--------|
+| Total API Latency (95th percentile) | <2.5s |
+| - Bedrock API (NL→SQL) | ~1,500ms |
+| - Database Query | <100ms |
+| - Result Formatting | <10ms |
+| - FastAPI Overhead | <10ms |
+
+**Memory Usage**:
+- Per Request: ~20MB (max 10,000 rows × 2KB/row)
+- Connection Pool: ~100MB (10 connections × 10MB each)
+- Total Application: ~200MB baseline + (20MB × concurrent requests)
+
+**Concurrency**: Max concurrent requests limited by connection pool (default: 10)
+
+### Documentation
+
+Comprehensive FastAPI backend documentation available at `notes/fastapi_backend.md` (350+ lines) covering:
+- Complete API reference
+- Architecture diagrams
+- Configuration guide
+- Security documentation
+- Performance metrics
+- Troubleshooting guide
+- Future enhancements
+
 ## Project Structure Rationale
 
 See README.md for detailed explanation, but key points:
@@ -677,6 +922,16 @@ See README.md for detailed explanation, but key points:
 - ✅ **QueryResult dataclass** - Immutable structured query responses
 - ✅ **Comprehensive test suite** - 70 tests (52 unit/integration + 18 end-to-end)
 
+**Completed (Phase 2c - FastAPI Backend)**:
+- ✅ **FastAPI REST API** (`src/backend/`) - HTTP API for natural language log queries
+- ✅ **POST /api/query endpoint** - Integrates BedrockSQLGenerator + QueryExecutor
+- ✅ **GET /api/health endpoint** - Database health monitoring
+- ✅ **Pydantic Models** - Request/response validation with field constraints
+- ✅ **Error Handling** - HTTP status code mapping for 6 error types
+- ✅ **CORS Middleware** - Configurable cross-origin resource sharing
+- ✅ **Lifespan Management** - Connection pool startup/shutdown
+- ✅ **API Tests** - 11 integration tests with mocked Bedrock
+- ✅ **Auto-generated API docs** - Swagger UI (/docs) and ReDoc (/redoc)
+
 **Next Steps (Phase 2 - Remaining)**:
-- FastAPI backend with `/query` endpoint
-- Result summarization with LLM
+- Result summarization with LLM (Phase 2d)
