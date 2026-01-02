@@ -7,15 +7,15 @@ validated SQL queries against PostgreSQL.
 
 Classes:
     DatabaseConnectionPool: Manages PostgreSQL connections with pooling
-    QueryExecutor: Executes SQL queries with security guardrails (future)
+    QueryExecutor: Executes SQL queries with security guardrails
     ResultFormatter: Formats query results (future)
     QueryResult: Structured query response (future)
 
 Exceptions:
     DatabaseError: Base exception for database operations
     ConnectionPoolError: Connection pool issues
-    QueryExecutionError: SQL execution failures (future)
-    QueryTimeoutError: Query timeout (future)
+    QueryExecutionError: SQL execution failures
+    QueryTimeoutError: Query timeout
     ResultFormattingError: Result formatting issues (future)
 """
 
@@ -252,6 +252,200 @@ class DatabaseConnectionPool:
             self.close_all()
         except:
             pass  # Ignore errors during cleanup
+
+
+# ============================================================================
+# QueryExecutor
+# ============================================================================
+
+class QueryExecutor:
+    """
+    Executes SQL queries with security guardrails.
+
+    Implements five layers of defense-in-depth security:
+    1. SQL validation (assumed done by BedrockSQLGenerator before this)
+    2. Read-only transaction enforcement (PostgreSQL-level)
+    3. Query timeout enforcement (prevents long-running queries)
+    4. Result row limits (prevents memory exhaustion)
+    5. Connection pool limits (prevents connection exhaustion)
+
+    Attributes:
+        pool (DatabaseConnectionPool): Connection pool for database access
+
+    Example:
+        >>> pool = DatabaseConnectionPool()
+        >>> executor = QueryExecutor(pool)
+        >>> result = executor.execute_query(
+        ...     "SELECT * FROM logs WHERE level = 'ERROR' LIMIT 10",
+        ...     timeout=30,
+        ...     max_rows=10000
+        ... )
+        >>> print(f"Found {len(result['rows'])} errors in {result['execution_time_ms']}ms")
+    """
+
+    def __init__(self, pool: DatabaseConnectionPool):
+        """
+        Initialize QueryExecutor with a connection pool.
+
+        Args:
+            pool: DatabaseConnectionPool instance for acquiring connections
+
+        Note:
+            The same pool can be shared across multiple QueryExecutor instances
+            in a multi-threaded environment (e.g., FastAPI workers).
+        """
+        self.pool = pool
+
+    def execute_query(
+        self,
+        sql: str,
+        timeout: int = 30,
+        max_rows: int = 10000
+    ) -> dict:
+        """
+        Execute SQL query with security guardrails and performance tracking.
+
+        Security layers applied:
+        1. Read-only transaction: Prevents data modification even if SQL validation bypassed
+        2. Query timeout: Cancels queries exceeding timeout limit
+        3. Row limit: Fetches maximum max_rows, sets truncated flag if more exist
+
+        Args:
+            sql: Validated SQL query (should come from BedrockSQLGenerator)
+            timeout: Query timeout in seconds (default: 30)
+            max_rows: Maximum rows to return (default: 10,000)
+
+        Returns:
+            dict with keys:
+                - rows: List of tuples containing query results
+                - column_names: List of column names from cursor.description
+                - execution_time_ms: Query execution time in milliseconds
+                - truncated: True if results exceeded max_rows
+                - row_count: Number of rows returned
+
+        Raises:
+            ConnectionPoolError: If connection cannot be acquired (retries once)
+            QueryExecutionError: If SQL execution fails
+            QueryTimeoutError: If query exceeds timeout limit
+
+        Example:
+            >>> executor = QueryExecutor(pool)
+            >>> result = executor.execute_query(
+            ...     "SELECT * FROM logs WHERE level = 'ERROR' ORDER BY timestamp DESC LIMIT 100"
+            ... )
+            >>> for row in result['rows']:
+            ...     print(row)
+        """
+        import time
+
+        conn = None
+        cursor = None
+        start_time = time.perf_counter()
+
+        try:
+            # Acquire connection from pool with retry logic
+            try:
+                conn = self.pool.get_connection()
+            except ConnectionPoolError as e:
+                # Retry once on connection failure (transient errors)
+                logger.warning(f"Connection failed, retrying: {str(e)}")
+                try:
+                    conn = self.pool.get_connection()
+                except Exception as retry_error:
+                    raise ConnectionPoolError(
+                        f"Failed to acquire connection after retry: {str(retry_error)}"
+                    )
+
+            cursor = conn.cursor()
+
+            # Security Layer 1: Set read-only transaction
+            cursor.execute("SET TRANSACTION READ ONLY")
+            logger.debug("Read-only transaction enforced")
+
+            # Security Layer 2: Set query timeout
+            timeout_ms = timeout * 1000
+            cursor.execute(f"SET statement_timeout = {timeout_ms}")
+            logger.debug(f"Query timeout set to {timeout}s")
+
+            # Execute the actual query
+            query_start = time.perf_counter()
+            try:
+                cursor.execute(sql)
+            except Exception as e:
+                error_msg = str(e)
+                # Check if it's a timeout error
+                if "canceling statement due to statement timeout" in error_msg.lower():
+                    raise QueryTimeoutError(
+                        f"Query exceeded timeout limit of {timeout}s: {error_msg}"
+                    )
+                else:
+                    raise QueryExecutionError(f"SQL execution failed: {error_msg}")
+
+            query_end = time.perf_counter()
+            execution_time_ms = (query_end - query_start) * 1000
+
+            # Security Layer 3: Fetch with row limit
+            # Fetch one extra row to detect truncation
+            rows = cursor.fetchmany(max_rows + 1)
+            truncated = len(rows) > max_rows
+
+            if truncated:
+                rows = rows[:max_rows]  # Trim to max_rows
+                logger.warning(
+                    f"Query results truncated: {max_rows} rows returned, more available"
+                )
+
+            # Extract column names from cursor description
+            column_names = [desc[0] for desc in cursor.description] if cursor.description else []
+
+            logger.info(
+                f"Query executed successfully: {len(rows)} rows, "
+                f"{execution_time_ms:.2f}ms, truncated={truncated}"
+            )
+
+            return {
+                "rows": rows,
+                "column_names": column_names,
+                "execution_time_ms": round(execution_time_ms, 2),
+                "truncated": truncated,
+                "row_count": len(rows)
+            }
+
+        except QueryTimeoutError:
+            # Re-raise timeout errors without wrapping
+            raise
+
+        except QueryExecutionError:
+            # Re-raise execution errors without wrapping
+            raise
+
+        except ConnectionPoolError:
+            # Re-raise connection errors without wrapping
+            raise
+
+        except Exception as e:
+            # Wrap unexpected errors
+            raise QueryExecutionError(f"Unexpected error during query execution: {str(e)}")
+
+        finally:
+            # Cleanup: Always close cursor and return connection
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except:
+                    pass  # Ignore cursor close errors
+
+            if conn is not None:
+                try:
+                    # Rollback to clean up read-only transaction
+                    conn.rollback()
+                except:
+                    pass  # Ignore rollback errors
+
+                try:
+                    self.pool.return_connection(conn)
+                except:
+                    pass  # Ignore return connection errors
 
 
 # ============================================================================

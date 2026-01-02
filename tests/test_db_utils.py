@@ -13,7 +13,10 @@ from unittest.mock import Mock, patch, MagicMock
 from psycopg2.pool import PoolError
 from src.shared.db_utils import (
     DatabaseConnectionPool,
+    QueryExecutor,
     ConnectionPoolError,
+    QueryExecutionError,
+    QueryTimeoutError,
     DatabaseError
 )
 
@@ -196,6 +199,220 @@ class TestDatabaseConnectionPoolUnit:
 
 
 # ============================================================================
+# Unit Tests: QueryExecutor (Mocked)
+# ============================================================================
+
+class TestQueryExecutorUnit:
+    """Unit tests for QueryExecutor with mocked connections."""
+
+    def test_execute_query_success(self):
+        """Test successful query execution with all security layers."""
+        with patch.dict(os.environ, {"DATABASE_URL": "postgresql://localhost/test"}):
+            with patch('src.shared.db_utils.pool.SimpleConnectionPool') as mock_pool:
+                # Mock connection and cursor
+                mock_conn = Mock()
+                mock_cursor = Mock()
+                mock_cursor.description = [("id",), ("timestamp",), ("level",), ("message",)]
+                mock_cursor.fetchmany.return_value = [
+                    (1, "2025-12-28 10:00:00", "ERROR", "Test error 1"),
+                    (2, "2025-12-28 11:00:00", "ERROR", "Test error 2")
+                ]
+                mock_conn.cursor.return_value = mock_cursor
+                mock_pool.return_value.getconn.return_value = mock_conn
+
+                # Create pool and executor
+                pool_obj = DatabaseConnectionPool()
+                executor = QueryExecutor(pool_obj)
+
+                # Execute query
+                result = executor.execute_query("SELECT * FROM logs WHERE level = 'ERROR' LIMIT 10")
+
+                # Verify security commands were executed
+                calls = [str(call) for call in mock_cursor.execute.call_args_list]
+                assert any("SET TRANSACTION READ ONLY" in str(call) for call in calls)
+                assert any("SET statement_timeout" in str(call) for call in calls)
+
+                # Verify result structure
+                assert result["rows"] == [
+                    (1, "2025-12-28 10:00:00", "ERROR", "Test error 1"),
+                    (2, "2025-12-28 11:00:00", "ERROR", "Test error 2")
+                ]
+                assert result["column_names"] == ["id", "timestamp", "level", "message"]
+                assert result["row_count"] == 2
+                assert result["truncated"] is False
+                assert "execution_time_ms" in result
+
+    def test_execute_query_with_truncation(self):
+        """Test query execution with result truncation."""
+        with patch.dict(os.environ, {"DATABASE_URL": "postgresql://localhost/test"}):
+            with patch('src.shared.db_utils.pool.SimpleConnectionPool') as mock_pool:
+                mock_conn = Mock()
+                mock_cursor = Mock()
+                mock_cursor.description = [("id",), ("message",)]
+
+                # Return max_rows + 1 rows to trigger truncation
+                mock_cursor.fetchmany.return_value = [(i, f"Message {i}") for i in range(6)]
+                mock_conn.cursor.return_value = mock_cursor
+                mock_pool.return_value.getconn.return_value = mock_conn
+
+                pool_obj = DatabaseConnectionPool()
+                executor = QueryExecutor(pool_obj)
+
+                # Execute with max_rows=5
+                result = executor.execute_query("SELECT * FROM logs", max_rows=5)
+
+                # Verify truncation
+                assert result["truncated"] is True
+                assert result["row_count"] == 5
+                assert len(result["rows"]) == 5
+
+    def test_execute_query_timeout(self):
+        """Test query timeout handling."""
+        with patch.dict(os.environ, {"DATABASE_URL": "postgresql://localhost/test"}):
+            with patch('src.shared.db_utils.pool.SimpleConnectionPool') as mock_pool:
+                mock_conn = Mock()
+                mock_cursor = Mock()
+
+                # Simulate timeout error only on the actual query
+                def execute_side_effect(sql):
+                    # Allow SET commands to pass through
+                    if "SET" in sql:
+                        return None
+                    # Fail on the actual SELECT query with timeout
+                    if "SELECT" in sql and "logs" in sql:
+                        raise Exception("canceling statement due to statement timeout")
+
+                mock_cursor.execute.side_effect = execute_side_effect
+                mock_conn.cursor.return_value = mock_cursor
+                mock_pool.return_value.getconn.return_value = mock_conn
+
+                pool_obj = DatabaseConnectionPool()
+                executor = QueryExecutor(pool_obj)
+
+                # Should raise QueryTimeoutError
+                with pytest.raises(QueryTimeoutError, match="Query exceeded timeout limit"):
+                    executor.execute_query("SELECT * FROM logs", timeout=1)
+
+    def test_execute_query_sql_error(self):
+        """Test SQL execution error handling."""
+        with patch.dict(os.environ, {"DATABASE_URL": "postgresql://localhost/test"}):
+            with patch('src.shared.db_utils.pool.SimpleConnectionPool') as mock_pool:
+                mock_conn = Mock()
+                mock_cursor = Mock()
+
+                # Simulate SQL syntax error only on the actual query
+                def execute_side_effect(sql):
+                    # Allow SET commands to pass through
+                    if "SET" in sql:
+                        return None
+                    # Fail on the actual SELECT query
+                    if "SELEC" in sql:
+                        raise Exception("syntax error at or near \"SELEC\"")
+
+                mock_cursor.execute.side_effect = execute_side_effect
+                mock_conn.cursor.return_value = mock_cursor
+                mock_pool.return_value.getconn.return_value = mock_conn
+
+                pool_obj = DatabaseConnectionPool()
+                executor = QueryExecutor(pool_obj)
+
+                # Should raise QueryExecutionError
+                with pytest.raises(QueryExecutionError, match="SQL execution failed"):
+                    executor.execute_query("SELEC * FROM logs")
+
+    def test_execute_query_connection_retry(self):
+        """Test connection retry logic on transient failure."""
+        with patch.dict(os.environ, {"DATABASE_URL": "postgresql://localhost/test"}):
+            with patch('src.shared.db_utils.pool.SimpleConnectionPool') as mock_pool:
+                mock_conn = Mock()
+                mock_cursor = Mock()
+                mock_cursor.description = [("id",)]
+                mock_cursor.fetchmany.return_value = [(1,)]
+                mock_conn.cursor.return_value = mock_cursor
+
+                # First call fails, second succeeds
+                mock_pool.return_value.getconn.side_effect = [
+                    PoolError("Pool exhausted"),
+                    mock_conn
+                ]
+
+                pool_obj = DatabaseConnectionPool()
+                executor = QueryExecutor(pool_obj)
+
+                # Should succeed after retry
+                result = executor.execute_query("SELECT * FROM logs LIMIT 1")
+                assert result["row_count"] == 1
+
+    def test_execute_query_connection_retry_failure(self):
+        """Test connection retry failure after second attempt."""
+        with patch.dict(os.environ, {"DATABASE_URL": "postgresql://localhost/test"}):
+            with patch('src.shared.db_utils.pool.SimpleConnectionPool') as mock_pool:
+                # Both attempts fail
+                mock_pool.return_value.getconn.side_effect = [
+                    PoolError("Pool exhausted"),
+                    PoolError("Pool exhausted")
+                ]
+
+                pool_obj = DatabaseConnectionPool()
+                executor = QueryExecutor(pool_obj)
+
+                # Should raise ConnectionPoolError after retry
+                with pytest.raises(ConnectionPoolError, match="Failed to acquire connection after retry"):
+                    executor.execute_query("SELECT * FROM logs LIMIT 1")
+
+    def test_execute_query_cleanup_on_error(self):
+        """Test that connections are properly returned even on error."""
+        with patch.dict(os.environ, {"DATABASE_URL": "postgresql://localhost/test"}):
+            with patch('src.shared.db_utils.pool.SimpleConnectionPool') as mock_pool:
+                mock_conn = Mock()
+                mock_cursor = Mock()
+
+                # Allow SET commands but fail on SELECT
+                def execute_side_effect(sql):
+                    if "SET" in sql:
+                        return None
+                    raise Exception("SQL error")
+
+                mock_cursor.execute.side_effect = execute_side_effect
+                mock_conn.cursor.return_value = mock_cursor
+                mock_pool.return_value.getconn.return_value = mock_conn
+
+                pool_obj = DatabaseConnectionPool()
+                executor = QueryExecutor(pool_obj)
+
+                # Execute query that will fail
+                try:
+                    executor.execute_query("SELECT * FROM logs")
+                except QueryExecutionError:
+                    pass
+
+                # Verify cleanup happened
+                mock_cursor.close.assert_called()
+                mock_conn.rollback.assert_called()
+                mock_pool.return_value.putconn.assert_called_with(mock_conn)
+
+    def test_execute_query_empty_result(self):
+        """Test query execution with no results."""
+        with patch.dict(os.environ, {"DATABASE_URL": "postgresql://localhost/test"}):
+            with patch('src.shared.db_utils.pool.SimpleConnectionPool') as mock_pool:
+                mock_conn = Mock()
+                mock_cursor = Mock()
+                mock_cursor.description = [("id",)]
+                mock_cursor.fetchmany.return_value = []  # No results
+                mock_conn.cursor.return_value = mock_cursor
+                mock_pool.return_value.getconn.return_value = mock_conn
+
+                pool_obj = DatabaseConnectionPool()
+                executor = QueryExecutor(pool_obj)
+
+                result = executor.execute_query("SELECT * FROM logs WHERE 1=0")
+
+                assert result["rows"] == []
+                assert result["row_count"] == 0
+                assert result["truncated"] is False
+
+
+# ============================================================================
 # Integration Tests: DatabaseConnectionPool (Real PostgreSQL)
 # ============================================================================
 
@@ -287,6 +504,159 @@ class TestDatabaseConnectionPoolIntegration:
         cursor.close()
         pool.return_connection(conn)
         pool.close_all()
+
+
+# ============================================================================
+# Integration Tests: QueryExecutor (Real PostgreSQL)
+# ============================================================================
+
+class TestQueryExecutorIntegration:
+    """Integration tests for QueryExecutor with real PostgreSQL."""
+
+    @pytest.fixture
+    def database_url(self):
+        """Get database URL from environment."""
+        db_url = os.getenv("DATABASE_URL")
+        if not db_url:
+            pytest.skip("DATABASE_URL not set - skipping integration tests")
+        return db_url
+
+    @pytest.fixture
+    def pool(self, database_url):
+        """Create connection pool for tests."""
+        pool_obj = DatabaseConnectionPool(database_url=database_url)
+        yield pool_obj
+        pool_obj.close_all()
+
+    def test_execute_query_real_db(self, pool):
+        """Test query execution against real database."""
+        executor = QueryExecutor(pool)
+
+        result = executor.execute_query(
+            "SELECT id, timestamp, level, source, message FROM logs LIMIT 5"
+        )
+
+        # Verify result structure
+        assert "rows" in result
+        assert "column_names" in result
+        assert "execution_time_ms" in result
+        assert "truncated" in result
+        assert "row_count" in result
+
+        # Verify column names
+        assert "id" in result["column_names"]
+        assert "timestamp" in result["column_names"]
+        assert "level" in result["column_names"]
+
+        # Verify results
+        assert result["row_count"] <= 5
+        assert result["truncated"] is False
+
+    def test_execute_query_with_where_clause(self, pool):
+        """Test query with WHERE clause."""
+        executor = QueryExecutor(pool)
+
+        result = executor.execute_query(
+            "SELECT id, level, message FROM logs WHERE level = 'ERROR' LIMIT 10"
+        )
+
+        # All returned rows should be ERROR level
+        for row in result["rows"]:
+            # row format: (id, level, message)
+            assert row[1] == "ERROR"
+
+    def test_execute_query_aggregation(self, pool):
+        """Test aggregation query."""
+        executor = QueryExecutor(pool)
+
+        result = executor.execute_query(
+            "SELECT level, COUNT(*) as count FROM logs GROUP BY level ORDER BY count DESC"
+        )
+
+        # Verify result structure
+        assert result["row_count"] >= 0
+        assert "level" in result["column_names"]
+        assert "count" in result["column_names"]
+
+    def test_execute_query_order_by(self, pool):
+        """Test query with ORDER BY."""
+        executor = QueryExecutor(pool)
+
+        result = executor.execute_query(
+            "SELECT id, timestamp FROM logs ORDER BY timestamp DESC LIMIT 3"
+        )
+
+        assert result["row_count"] <= 3
+
+        # Verify timestamps are in descending order
+        if result["row_count"] >= 2:
+            for i in range(result["row_count"] - 1):
+                # Timestamps should be descending
+                assert result["rows"][i][1] >= result["rows"][i + 1][1]
+
+    def test_execute_query_truncation_real_db(self, pool):
+        """Test result truncation with real database."""
+        executor = QueryExecutor(pool)
+
+        # Set max_rows to 5 and query for more
+        result = executor.execute_query(
+            "SELECT * FROM logs LIMIT 100",
+            max_rows=5
+        )
+
+        # Should be truncated if logs table has > 5 rows
+        if result["row_count"] == 5:
+            # If we got 5 rows and there are more in the database, truncated should be True
+            # We can't guarantee this without knowing the table size, so just verify structure
+            assert isinstance(result["truncated"], bool)
+            assert result["row_count"] == 5
+
+    def test_execute_query_empty_result_real_db(self, pool):
+        """Test query with no results."""
+        executor = QueryExecutor(pool)
+
+        result = executor.execute_query(
+            "SELECT * FROM logs WHERE id = -999999"
+        )
+
+        assert result["rows"] == []
+        assert result["row_count"] == 0
+        assert result["truncated"] is False
+
+    def test_execute_query_metadata_jsonb(self, pool):
+        """Test query accessing JSONB metadata field."""
+        executor = QueryExecutor(pool)
+
+        result = executor.execute_query(
+            "SELECT id, metadata FROM logs WHERE metadata IS NOT NULL LIMIT 3"
+        )
+
+        # Verify we can access metadata
+        assert result["row_count"] <= 3
+        if result["row_count"] > 0:
+            assert "metadata" in result["column_names"]
+
+    def test_read_only_enforcement_real_db(self, pool):
+        """Test that read-only transaction prevents writes."""
+        executor = QueryExecutor(pool)
+
+        # Attempt to insert - should fail due to read-only transaction
+        with pytest.raises(QueryExecutionError, match="read-only transaction"):
+            executor.execute_query(
+                "INSERT INTO logs (timestamp, level, message) "
+                "VALUES (NOW(), 'TEST', 'Should fail')"
+            )
+
+    def test_query_performance_tracking(self, pool):
+        """Test that execution time is tracked."""
+        executor = QueryExecutor(pool)
+
+        result = executor.execute_query("SELECT 1")
+
+        # Execution time should be tracked and reasonable
+        assert "execution_time_ms" in result
+        assert result["execution_time_ms"] > 0
+        assert result["execution_time_ms"] < 1000  # Should complete in < 1 second
 
 
 # ============================================================================
