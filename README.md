@@ -1,11 +1,36 @@
 
 # ANALYTICS COPILOT FOR SPLUNK / LOGS
 
-I am not actually connecting or licensing to Splunk here. It is a splunk-alternative analytics system.
-- it ingests logs (like Splunk)
-- stores them in PostGreSQL (instead of Splunk's proprietary index)
-- uses LLMs to translate natrual language into queries
-- performs analytics and anomaly detection (like Splunk but AI-powered)
+An AI-powered log analytics system that serves as a Splunk alternative:
+- **Ingests logs** (like Splunk) from various services
+- **Stores in PostgreSQL** (instead of Splunk's proprietary index) with vector embeddings
+- **Translates natural language to SQL** using AWS Bedrock Claude
+- **Generates intelligent summaries** of query results using LLMs
+- **Performs semantic search** using pgvector for meaning-based log queries
+
+## Project Status
+
+### Phase 1: Foundation & Data Pipeline ✅ COMPLETE
+- PostgreSQL database with pgvector extension
+- Synthetic log generator (9 services: sshd, nginx, kernel, etc.)
+- ETL pipeline with embedding generation
+- Semantic search implementation
+
+### Phase 2: LLM Integration ✅ COMPLETE
+- **2a: AWS Bedrock SQL Generator** - Natural language → SQL translation
+- **2b: Database Utilities** - Connection pooling, query execution, result formatting
+- **2c: FastAPI Backend** - REST API with validation and error handling
+- **2d: Result Summarization** - LLM-powered summaries of query results
+
+### Phase 3: Intelligence Layer (Upcoming)
+- Anomaly detection using statistical methods
+- Automated runbook generation
+- Pattern recognition for common issues
+
+### Phase 4: Web App & AWS Deployment (Future)
+- React frontend
+- AWS deployment with CloudFormation
+- Production monitoring
 
 ## Requirements
 - PostGreSQL
@@ -216,4 +241,169 @@ Finds logs with similar embeddings:
 - `Invalid password attempt` → [0.22, -0.38, 0.85, ...]
 - `Auth token expired` → [0.26, -0.41, 0.88, ...]
 When embeddings are close in vector space => similar meaning
+
+## API Usage
+
+### Starting the Server
+
+```bash
+# Activate virtual environment
+source venv_llm_logs/bin/activate
+
+# Start development server (with hot reload)
+uvicorn src.backend.app:app --reload --host 0.0.0.0 --port 8000
+
+# Production mode (multi-worker)
+uvicorn src.backend.app:app --host 0.0.0.0 --port 8000 --workers 4 --log-level info
+```
+
+**Server URLs**:
+- API: http://localhost:8000
+- Interactive Docs (Swagger): http://localhost:8000/docs
+- Alternative Docs (ReDoc): http://localhost:8000/redoc
+
+### Query Logs with Natural Language
+
+#### Basic Query
+```bash
+curl -X POST http://localhost:8000/api/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "show me errors from yesterday",
+    "max_rows": 10
+  }'
+```
+
+#### Response with AI Summary (Default)
+```json
+{
+  "success": true,
+  "summary": "Found 15 nginx errors yesterday concentrated between 2:30-4:45 PM. Most common: connection timeouts (8 occurrences) and 502 Bad Gateway errors (7). Top affected endpoint: /api/users. Errors correlate with increased traffic during peak hours.",
+  "summary_success": true,
+  "summary_execution_time_ms": 1523.4,
+  "rows": [
+    {
+      "id": 42,
+      "timestamp": "2025-12-28T14:30:00+01:00",
+      "level": "ERROR",
+      "source": "nginx",
+      "message": "Connection timeout",
+      "metadata": {"status_code": "502", "endpoint": "/api/users"}
+    }
+  ],
+  "row_count": 15,
+  "column_names": ["id", "timestamp", "level", "source", "message", "metadata"],
+  "execution_time_ms": 156.2,
+  "truncated": false,
+  "sql_query": "SELECT id, timestamp, level, source, message, metadata FROM logs WHERE level = 'ERROR' AND timestamp >= NOW() - INTERVAL '1 day' ORDER BY timestamp DESC LIMIT 10;"
+}
+```
+
+#### Query Without Summary
+```bash
+curl -X POST http://localhost:8000/api/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "count errors by service",
+    "include_summary": false
+  }'
+```
+
+### API Endpoints
+
+#### POST /api/query
+Execute natural language queries against logs.
+
+**Request Parameters**:
+- `query` (required): Natural language query string (1-500 chars)
+- `max_rows` (optional): Maximum rows to return (1-50,000, default: 10,000)
+- `timeout` (optional): Query timeout in seconds (1-300, default: 30)
+- `include_summary` (optional): Generate AI summary (default: true)
+
+**Response Fields**:
+- `success`: Whether query executed successfully
+- `summary`: AI-generated natural language summary (if enabled)
+- `summary_success`: Whether summarization succeeded
+- `summary_execution_time_ms`: Time spent generating summary
+- `rows`: Query result data
+- `row_count`: Number of rows returned
+- `column_names`: Column headers
+- `execution_time_ms`: Query execution time
+- `truncated`: Whether results were truncated
+- `sql_query`: Generated SQL query
+
+#### GET /api/health
+Check API and database health.
+
+```bash
+curl http://localhost:8000/api/health
+```
+
+**Response**:
+```json
+{
+  "status": "healthy",
+  "database_connected": true,
+  "bedrock_available": true
+}
+```
+
+### Example Queries
+
+**Temporal Filtering**:
+```bash
+# Find errors from last hour
+curl -X POST http://localhost:8000/api/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "show nginx errors in the last hour"}'
+```
+
+**Text Search**:
+```bash
+# Search for login failures
+curl -X POST http://localhost:8000/api/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "find login failures"}'
+```
+
+**Aggregations**:
+```bash
+# Count errors by service
+curl -X POST http://localhost:8000/api/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "count errors by service"}'
+```
+
+**Metadata Filtering**:
+```bash
+# Find specific HTTP status codes
+curl -X POST http://localhost:8000/api/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "show nginx 500 errors"}'
+```
+
+### Error Handling
+
+The API returns appropriate HTTP status codes:
+
+| Status Code | Error Type | Description |
+|-------------|------------|-------------|
+| 200 | Success | Query executed successfully |
+| 400 | ValidationError | SQL validation failed (dangerous operation blocked) |
+| 400 | QueryExecutionError | SQL execution error (syntax, invalid column) |
+| 408 | QueryTimeoutError | Query exceeded timeout limit |
+| 422 | Pydantic ValidationError | Invalid request parameters |
+| 502 | BedrockError | AWS Bedrock API error |
+| 503 | ConnectionPoolError | Database unavailable |
+
+**Example Error Response**:
+```json
+{
+  "detail": {
+    "success": false,
+    "error": "Only SELECT queries allowed",
+    "error_type": "ValidationError"
+  }
+}
+```
 
