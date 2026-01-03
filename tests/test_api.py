@@ -11,6 +11,7 @@ from unittest.mock import patch
 from src.backend.app import app
 from src.shared.bedrock_client import ValidationError, BedrockError
 from src.shared.db_utils import QueryResult
+from src.shared.result_summarizer import SummaryResult
 
 
 @pytest.fixture(scope="module")
@@ -136,6 +137,111 @@ class TestEndpoints:
         assert "error" in data["detail"]
         assert "error_type" in data["detail"]
         assert data["detail"]["success"] is False
+
+    def test_query_with_summary_enabled(self, test_client, test_db_with_fixtures):
+        """Test query endpoint with summary generation enabled."""
+        mock_sql = "SELECT * FROM logs LIMIT 5;"
+        mock_summary = SummaryResult(
+            summary="Found 5 logs across multiple services. Most are INFO level messages.",
+            success=True,
+            model_id="us.anthropic.claude-3-haiku-20240307-v1:0",
+            execution_time_ms=1523.4
+        )
+
+        with patch('src.backend.routes.sql_generator.generate_sql', return_value=mock_sql), \
+             patch('src.backend.app.result_summarizer') as mock_summarizer:
+            # Configure mock summarizer to return our mock result
+            mock_summarizer.summarize.return_value = mock_summary
+
+            response = test_client.post(
+                "/api/query",
+                json={"query": "show logs", "max_rows": 5, "include_summary": True}
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+
+        # Verify summary fields are present
+        assert "summary" in data
+        assert "summary_success" in data
+        assert "summary_execution_time_ms" in data
+
+        # Verify summary values
+        assert data["summary"] == mock_summary.summary
+        assert data["summary_success"] is True
+        assert data["summary_execution_time_ms"] == 1523.4
+
+    def test_query_with_summary_disabled(self, test_client, test_db_with_fixtures):
+        """Test query endpoint with summary generation disabled."""
+        mock_sql = "SELECT * FROM logs LIMIT 5;"
+
+        with patch('src.backend.routes.sql_generator.generate_sql', return_value=mock_sql):
+            response = test_client.post(
+                "/api/query",
+                json={"query": "show logs", "max_rows": 5, "include_summary": False}
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+
+        # Verify summary fields are None when disabled
+        assert data["summary"] is None
+        assert data["summary_success"] is None
+        assert data["summary_execution_time_ms"] is None
+
+    def test_query_with_summary_default(self, test_client, test_db_with_fixtures):
+        """Test query endpoint uses summary by default (include_summary defaults to True)."""
+        mock_sql = "SELECT * FROM logs LIMIT 5;"
+        mock_summary = SummaryResult(
+            summary="Default summary test",
+            success=True,
+            model_id="us.anthropic.claude-3-haiku-20240307-v1:0",
+            execution_time_ms=1500.0
+        )
+
+        with patch('src.backend.routes.sql_generator.generate_sql', return_value=mock_sql), \
+             patch('src.backend.app.result_summarizer') as mock_summarizer:
+            # Configure mock summarizer to return our mock result
+            mock_summarizer.summarize.return_value = mock_summary
+
+            # Don't specify include_summary - should default to True
+            response = test_client.post(
+                "/api/query",
+                json={"query": "show logs", "max_rows": 5}
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+
+        # Summary should be present since default is True
+        assert data["summary"] is not None
+        assert data["summary_success"] is True
+
+    def test_summary_generation_failure_handling(self, test_client, test_db_with_fixtures):
+        """Test that summary generation failures don't break the API."""
+        mock_sql = "SELECT * FROM logs LIMIT 5;"
+
+        with patch('src.backend.routes.sql_generator.generate_sql', return_value=mock_sql), \
+             patch('src.backend.app.result_summarizer') as mock_summarizer:
+            # Make summarize raise an exception
+            mock_summarizer.summarize.side_effect = Exception("Bedrock API error")
+
+            response = test_client.post(
+                "/api/query",
+                json={"query": "show logs", "include_summary": True}
+            )
+
+        # Query should still succeed even if summary fails
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+
+        # Summary should indicate failure
+        assert data["summary"] is not None
+        assert "Summary generation failed" in data["summary"]
+        assert data["summary_success"] is False
 
 
 if __name__ == "__main__":

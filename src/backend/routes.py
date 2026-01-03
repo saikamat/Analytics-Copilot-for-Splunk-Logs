@@ -42,7 +42,8 @@ sql_generator = BedrockSQLGenerator()
     Flow:
     1. Translate natural language to SQL using AWS Bedrock
     2. Execute SQL with security guardrails (read-only, timeout, row limits)
-    3. Return formatted results with execution time
+    3. Generate LLM summary of results (if include_summary=True, adds ~1.5s)
+    4. Return formatted results with execution time and optional summary
 
     Examples:
     - "show me errors from yesterday"
@@ -64,7 +65,7 @@ async def execute_query(request: QueryRequest):
         HTTPException: Various HTTP errors mapped from underlying exceptions
     """
     start_time = time.time()
-    logger.info(f"Query request received: '{request.query}' (max_rows={request.max_rows}, timeout={request.timeout})")
+    logger.info(f"Query request received: '{request.query}' (max_rows={request.max_rows}, timeout={request.timeout}, include_summary={request.include_summary})")
 
     try:
         # Step 1: Generate SQL from natural language
@@ -95,7 +96,40 @@ async def execute_query(request: QueryRequest):
             max_rows=request.max_rows
         )
 
-        # Step 3: Return formatted response
+        # Step 3: Generate summary (if requested)
+        summary = None
+        summary_success = None
+        summary_execution_time_ms = None
+
+        if request.include_summary:
+            logger.debug("Generating summary of query results...")
+
+            # Import result_summarizer from app module (initialized in lifespan)
+            from src.backend.app import result_summarizer
+
+            if result_summarizer is None:
+                logger.warning("ResultSummarizer not initialized - skipping summary generation")
+            else:
+                try:
+                    summary_result = result_summarizer.summarize(
+                        original_query=request.query,
+                        sql_query=sql,
+                        result=result
+                    )
+                    summary = summary_result.summary
+                    summary_success = summary_result.success
+                    summary_execution_time_ms = summary_result.execution_time_ms
+
+                    logger.info(
+                        f"Summary generated: {summary_success} in {summary_execution_time_ms:.1f}ms"
+                    )
+                except Exception as e:
+                    logger.warning(f"Summary generation failed: {e}")
+                    summary = f"Summary generation failed: {str(e)}"
+                    summary_success = False
+                    summary_execution_time_ms = 0.0
+
+        # Step 4: Return formatted response
         total_time = (time.time() - start_time) * 1000  # Convert to milliseconds
         logger.info(
             f"Query completed successfully: {result.row_count} rows in {result.execution_time_ms:.1f}ms "
@@ -109,7 +143,10 @@ async def execute_query(request: QueryRequest):
             column_names=result.column_names,
             execution_time_ms=result.execution_time_ms,
             truncated=result.truncated,
-            sql_query=sql  # Include generated SQL for transparency
+            sql_query=sql,  # Include generated SQL for transparency
+            summary=summary,
+            summary_success=summary_success,
+            summary_execution_time_ms=summary_execution_time_ms
         )
 
     except ValidationError as e:

@@ -13,11 +13,11 @@ This is an **AI-powered log analytics system** - a Splunk alternative that uses:
 
 The project follows a **4-phase development approach**:
 1. **Phase 1** (Complete): Foundation & Data Pipeline
-2. **Phase 2** (Almost Complete): LLM Integration for natural language queries
+2. **Phase 2** (Complete): LLM Integration for natural language queries
    - ✅ 2a: AWS Bedrock SQL Generator
    - ✅ 2b: Database Utilities (connection pooling, query execution)
    - ✅ 2c: FastAPI Backend (REST API endpoints)
-   - ⏳ 2d: Result Summarization (LLM-based summaries)
+   - ✅ 2d: Result Summarization (LLM-based summaries)
 3. **Phase 3**: Intelligence Layer (anomaly detection, runbooks)
 4. **Phase 4**: Web App & AWS Deployment
 
@@ -40,13 +40,14 @@ Log Generation → ETL Pipeline → PostgreSQL (with embeddings)
 
 **Query Pipeline**:
 ```
-HTTP Request → FastAPI → BedrockSQLGenerator → QueryExecutor → PostgreSQL → Results
+HTTP Request → FastAPI → BedrockSQLGenerator → QueryExecutor → PostgreSQL → BedrockResultSummarizer → Results
 ```
 
 1. **HTTP API** (`src/backend/app.py`): FastAPI REST API with Pydantic validation
 2. **NL→SQL Translation** (`src/shared/bedrock_client.py`): Claude translates natural language to SQL
 3. **SQL Execution** (`src/shared/db_utils.py`): QueryExecutor with security and timeouts
 4. **Database**: PostgreSQL with pgvector for semantic search using `<=>` operator
+5. **Result Summarization** (`src/shared/result_summarizer.py`): Optional Claude-powered summaries of query results
 
 ### Database Schema
 
@@ -545,9 +546,9 @@ The project includes comprehensive test coverage for all database utilities and 
 - `conftest.py`: Pytest fixtures for test database setup/teardown and fixture data
 - `test_db_utils.py`: Unit and integration tests for database utilities (52 tests)
 - `test_integration_e2e.py`: End-to-end integration tests (18 tests)
-- `test_api.py`: FastAPI integration tests (11 tests)
+- `test_api.py`: FastAPI integration tests (15 tests)
 
-**Total Test Count**: 81 tests covering unit, integration, end-to-end, and API scenarios
+**Total Test Count**: 85 tests covering unit, integration, end-to-end, and API scenarios
 
 ### Running Tests
 
@@ -561,7 +562,7 @@ python -m pytest tests/ -v
 # Run specific test file
 python -m pytest tests/test_db_utils.py -v        # 52 database utility tests
 python -m pytest tests/test_integration_e2e.py -v  # 18 end-to-end tests
-python -m pytest tests/test_api.py -v             # 11 API integration tests
+python -m pytest tests/test_api.py -v             # 15 API integration tests
 
 # Run with short traceback (cleaner output)
 python -m pytest tests/ -v --tb=short
@@ -570,7 +571,7 @@ python -m pytest tests/ -v --tb=short
 python -m pytest tests/test_integration_e2e.py::TestEndToEndFlow::test_end_to_end_with_bedrock -v
 ```
 
-**Total Test Coverage**: 81 tests (52 database utilities + 18 end-to-end + 11 API)
+**Total Test Coverage**: 85 tests (52 database utilities + 18 end-to-end + 15 API)
 
 ### Test Database Setup
 
@@ -822,7 +823,7 @@ The API implements 8 layers of security:
 
 ### Testing
 
-**API Integration Tests** (`tests/test_api.py` - 11 tests):
+**API Integration Tests** (`tests/test_api.py` - 15 tests):
 
 ```bash
 # Run all API tests
@@ -843,6 +844,10 @@ python -m pytest tests/test_api.py -v --tb=short
 - Invalid max_rows/timeout validation (422)
 - Response structure verification
 - Error response consistency
+- Summary enabled (`include_summary: true`)
+- Summary disabled (`include_summary: false`)
+- Summary default behavior (defaults to `true`)
+- Summary failure handling (graceful degradation)
 
 **Key Testing Pattern**: Use TestClient with context manager to trigger lifespan events:
 
@@ -884,6 +889,184 @@ Comprehensive FastAPI backend documentation available at `notes/fastapi_backend.
 - Troubleshooting guide
 - Future enhancements
 
+## Result Summarization (Phase 2d)
+
+**Location**: `src/shared/result_summarizer.py`
+
+Provides LLM-powered natural language summaries of SQL query results. Integrated with the FastAPI `/api/query` endpoint to give users concise, insight-focused summaries instead of raw data.
+
+### Architecture
+
+```python
+QueryResult (from QueryExecutor)
+    ↓
+BedrockResultSummarizer.summarize(original_query, sql_query, result)
+    ↓ Few-shot prompt with query context + results preview
+AWS Bedrock Claude (Haiku)
+    ↓ Natural language summary
+SummaryResult (summary, success, model_id, execution_time_ms)
+```
+
+### Core Components
+
+**BedrockResultSummarizer**:
+- Generates 2-4 sentence summaries highlighting key insights
+- Uses Claude 3 Haiku for cost-effective summarization (~$0.0003/summary)
+- Temperature 0.3 for slight creativity while maintaining consistency
+- Handles 6 diverse query patterns via few-shot learning
+
+**SummaryResult** (dataclass):
+```python
+@dataclass(frozen=True)
+class SummaryResult:
+    summary: str                    # Natural language summary text
+    success: bool                   # Whether summarization succeeded
+    model_id: str                   # Bedrock model ID used
+    execution_time_ms: float        # Time taken in milliseconds
+    error_message: Optional[str]    # Error if failed
+```
+
+### Few-Shot Learning Strategy
+
+**6 Examples Cover**:
+1. **Empty results**: Constructive explanation when 0 rows returned
+2. **Error logs with temporal filtering**: Pattern detection across services
+3. **Aggregation queries**: Highlighting top contributors and percentages
+4. **Text search (security patterns)**: Identifying brute force attempts
+5. **Metadata filtering**: Correlating errors with specific conditions
+6. **Large truncated results**: Advising users to narrow queries
+
+**Example Summary**:
+```
+Query: "show me errors from yesterday"
+Result: 47 ERROR logs
+
+Summary:
+Found 47 errors in the last 24 hours affecting multiple services. Top issues
+include nginx connection timeouts (502 errors on /api/users), PostgreSQL
+connection pool exhaustion (100 active connections), and docker container
+failures (redis-cache). Most errors occurred between 8-11 PM, suggesting
+increased traffic load.
+```
+
+### API Integration
+
+The summarizer is integrated into the `/api/query` endpoint with the `include_summary` field:
+
+**Request**:
+```bash
+curl -X POST http://localhost:8000/api/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "show nginx errors from yesterday",
+    "include_summary": true
+  }'
+```
+
+**Response with Summary**:
+```json
+{
+  "success": true,
+  "rows": [...],
+  "row_count": 15,
+  "execution_time_ms": 156.2,
+  "summary": "Found 15 nginx errors concentrated around 4:30-4:45 PM...",
+  "summary_success": true,
+  "summary_execution_time_ms": 1523.4
+}
+```
+
+**Key Features**:
+- **Optional**: Controlled via `include_summary` field (defaults to `true`)
+- **Non-breaking**: Summary failures don't affect query success
+- **Transparent**: Includes execution time and success status
+- **Graceful degradation**: Returns fallback summary on Bedrock errors
+
+### Configuration
+
+**Environment Variables** (`.env`):
+```bash
+AWS_REGION="us-east-1"
+BEDROCK_MODEL_ID="anthropic.claude-haiku-4-5-20251001-v1:0"  # Direct model ID for summarization
+AWS_ACCESS_KEY_ID="your_key"
+AWS_SECRET_ACCESS_KEY="your_secret"
+```
+
+**Note**: Summarization uses direct model IDs (not inference profiles) because it targets a specific model version.
+
+### Error Handling
+
+**Fallback Strategies**:
+1. **Failed queries**: Returns `"Query failed: {error_message}"`
+2. **Bedrock API errors**: Returns `"Query returned N rows in Xms. Summary generation failed due to API error."`
+3. **Malformed responses**: Returns `"Query returned N rows in Xms. Summary generation failed due to response parsing error."`
+
+**Retry Logic**: Exponential backoff for `ThrottlingException` (3 retries: 1s, 2s, 4s delays)
+
+### Performance
+
+| Metric | Value |
+|--------|-------|
+| Average latency | ~1,500ms (Bedrock API call) |
+| Token usage | ~3,000 input + ~150 output tokens |
+| Cost per summary | ~$0.0003 (Haiku pricing) |
+| Temperature | 0.3 (consistency + natural phrasing) |
+| Max tokens | 512 (2-4 sentence summaries) |
+
+**Optimization**:
+- Previews only first 10 rows (token efficiency)
+- Few-shot examples built once at initialization
+- Async-compatible for FastAPI integration
+
+### Testing
+
+**API Tests** (`tests/test_api.py` - 15 tests total):
+- Summary enabled (`include_summary: true`)
+- Summary disabled (`include_summary: false`)
+- Default behavior (defaults to `true`)
+- Error handling (summary failures don't break query)
+
+**Run Tests**:
+```bash
+source venv_llm_logs/bin/activate
+python -m pytest tests/test_api.py -v --tb=short
+```
+
+**Manual Testing**:
+```bash
+# Test summarizer standalone
+python -m src.shared.result_summarizer
+
+# Test via API
+uvicorn src.backend.app:app --reload
+curl -X POST http://localhost:8000/api/query -H "Content-Type: application/json" \
+  -d '{"query": "show errors from yesterday", "include_summary": true}'
+```
+
+### Usage Pattern
+
+```python
+from src.shared.result_summarizer import BedrockResultSummarizer
+from src.shared.db_utils import QueryResult
+
+# Initialize once (module level or app startup)
+summarizer = BedrockResultSummarizer()
+
+# Execute query (from QueryExecutor)
+result = executor.execute_query("SELECT * FROM logs WHERE level='ERROR'")
+
+# Generate summary
+summary_result = summarizer.summarize(
+    original_query="show errors from yesterday",
+    sql_query="SELECT * FROM logs WHERE level='ERROR'...",
+    result=result
+)
+
+print(f"Summary: {summary_result.summary}")
+print(f"Success: {summary_result.success}")
+print(f"Time: {summary_result.execution_time_ms:.1f}ms")
+```
+
 ## Project Structure Rationale
 
 See README.md for detailed explanation, but key points:
@@ -924,14 +1107,26 @@ See README.md for detailed explanation, but key points:
 
 **Completed (Phase 2c - FastAPI Backend)**:
 - ✅ **FastAPI REST API** (`src/backend/`) - HTTP API for natural language log queries
-- ✅ **POST /api/query endpoint** - Integrates BedrockSQLGenerator + QueryExecutor
+- ✅ **POST /api/query endpoint** - Integrates BedrockSQLGenerator + QueryExecutor + ResultSummarizer
 - ✅ **GET /api/health endpoint** - Database health monitoring
 - ✅ **Pydantic Models** - Request/response validation with field constraints
 - ✅ **Error Handling** - HTTP status code mapping for 6 error types
 - ✅ **CORS Middleware** - Configurable cross-origin resource sharing
-- ✅ **Lifespan Management** - Connection pool startup/shutdown
-- ✅ **API Tests** - 11 integration tests with mocked Bedrock
+- ✅ **Lifespan Management** - Connection pool and summarizer startup/shutdown
+- ✅ **API Tests** - 15 integration tests with mocked Bedrock
 - ✅ **Auto-generated API docs** - Swagger UI (/docs) and ReDoc (/redoc)
 
-**Next Steps (Phase 2 - Remaining)**:
-- Result summarization with LLM (Phase 2d)
+**Completed (Phase 2d - Result Summarization)**:
+- ✅ **BedrockResultSummarizer** (`src/shared/result_summarizer.py`) - LLM-powered result summaries
+- ✅ **SummaryResult dataclass** - Immutable summary responses with metadata
+- ✅ **Few-shot learning** - 6 diverse examples covering query patterns
+- ✅ **API integration** - Optional `include_summary` field in `/api/query`
+- ✅ **Graceful degradation** - Summary failures don't break queries
+- ✅ **Error handling** - Fallback summaries with retry logic
+
+**Phase 2 Complete!** All natural language query features implemented and tested.
+
+**Next Steps (Phase 3 - Intelligence Layer)**:
+- Anomaly detection using statistical methods
+- Automated runbook generation
+- Pattern recognition for common issues

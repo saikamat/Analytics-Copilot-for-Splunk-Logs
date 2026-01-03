@@ -33,6 +33,11 @@ class QueryRequest(BaseModel):
         description="Query timeout in seconds (1-300)",
         examples=[30]
     )
+    include_summary: bool = Field(
+        default=True,
+        description="Whether to generate LLM summary of results (adds ~1.5s latency)",
+        examples=[True]
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -40,12 +45,14 @@ class QueryRequest(BaseModel):
                 {
                     "query": "show me all nginx errors from yesterday",
                     "max_rows": 100,
-                    "timeout": 30
+                    "timeout": 30,
+                    "include_summary": True
                 },
                 {
                     "query": "count errors by service in the last hour",
                     "max_rows": 50,
-                    "timeout": 10
+                    "timeout": 10,
+                    "include_summary": False
                 }
             ]
         }
@@ -79,6 +86,18 @@ class QueryResponse(BaseModel):
         default=None,
         description="Generated SQL query (for transparency)"
     )
+    summary: Optional[str] = Field(
+        default=None,
+        description="Natural language summary of results (if include_summary=True)"
+    )
+    summary_success: Optional[bool] = Field(
+        default=None,
+        description="Whether summary generation succeeded (if include_summary=True)"
+    )
+    summary_execution_time_ms: Optional[float] = Field(
+        default=None,
+        description="Time taken for summary generation in milliseconds (if include_summary=True)"
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -99,7 +118,10 @@ class QueryResponse(BaseModel):
                     "column_names": ["id", "timestamp", "level", "source", "message", "metadata"],
                     "execution_time_ms": 1567.3,
                     "truncated": False,
-                    "sql_query": "SELECT * FROM logs WHERE level = 'ERROR' AND timestamp >= NOW() - INTERVAL '1 day'"
+                    "sql_query": "SELECT * FROM logs WHERE level = 'ERROR' AND timestamp >= NOW() - INTERVAL '1 day'",
+                    "summary": "Found 15 errors in the last 24 hours. Most errors are from nginx (502 Bad Gateway) and PostgreSQL (connection pool exhaustion). The issues started around 2pm and continued until 5pm, suggesting a service disruption during that window.",
+                    "summary_success": True,
+                    "summary_execution_time_ms": 1523.4
                 }
             ]
         }
