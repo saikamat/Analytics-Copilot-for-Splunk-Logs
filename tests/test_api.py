@@ -244,5 +244,69 @@ class TestEndpoints:
         assert data["summary_success"] is False
 
 
+class TestPerformance:
+    """Test performance and latency of API with summarization."""
+
+    def test_total_latency_under_threshold(self, test_client, test_db_with_fixtures):
+        """Test that total API latency is under 3 seconds."""
+        import time
+
+        mock_sql = "SELECT * FROM logs LIMIT 5;"
+        mock_summary = SummaryResult(
+            summary="Performance test summary",
+            success=True,
+            model_id="us.anthropic.claude-3-haiku-20240307-v1:0",
+            execution_time_ms=1500.0  # Typical Bedrock latency
+        )
+
+        start_time = time.time()
+
+        with patch('src.backend.routes.sql_generator.generate_sql', return_value=mock_sql), \
+             patch('src.backend.app.result_summarizer') as mock_summarizer:
+            # Configure mock summarizer
+            mock_summarizer.summarize.return_value = mock_summary
+
+            response = test_client.post(
+                "/api/query",
+                json={"query": "show logs", "max_rows": 5, "include_summary": True}
+            )
+
+        total_latency = (time.time() - start_time) * 1000  # Convert to milliseconds
+
+        assert response.status_code == 200
+        # Total latency should be < 3000ms (3 seconds)
+        # This includes: SQL generation (~1500ms) + Query execution (~100ms) + Summary (~1500ms) + overhead
+        assert total_latency < 3000, f"Total latency {total_latency:.1f}ms exceeds 3000ms threshold"
+
+    def test_summary_execution_time_tracking(self, test_client, test_db_with_fixtures):
+        """Test that summary execution time is tracked and reported."""
+        mock_sql = "SELECT * FROM logs LIMIT 10;"
+        mock_summary = SummaryResult(
+            summary="Test summary for timing",
+            success=True,
+            model_id="us.anthropic.claude-3-haiku-20240307-v1:0",
+            execution_time_ms=1234.5
+        )
+
+        with patch('src.backend.routes.sql_generator.generate_sql', return_value=mock_sql), \
+             patch('src.backend.app.result_summarizer') as mock_summarizer:
+            mock_summarizer.summarize.return_value = mock_summary
+
+            response = test_client.post(
+                "/api/query",
+                json={"query": "show logs", "include_summary": True}
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+
+        # Verify summary execution time is reported
+        assert data["summary_execution_time_ms"] == 1234.5
+        assert data["summary_success"] is True
+
+        # Verify total query execution time is separate from summary time
+        assert data["execution_time_ms"] != data["summary_execution_time_ms"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

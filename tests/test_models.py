@@ -259,7 +259,8 @@ class TestModelSerialization:
         assert json_data == {
             "query": "test query",
             "max_rows": 100,
-            "timeout": 30
+            "timeout": 30,
+            "include_summary": True  # Default value
         }
 
     def test_query_response_serialization(self):

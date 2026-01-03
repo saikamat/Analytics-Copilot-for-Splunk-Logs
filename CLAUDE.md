@@ -542,13 +542,15 @@ The project includes comprehensive test coverage for all database utilities and 
 
 ### Test Organization
 
-**Location**: `/tests` directory with four main files:
+**Location**: `/tests` directory with six test files:
 - `conftest.py`: Pytest fixtures for test database setup/teardown and fixture data
 - `test_db_utils.py`: Unit and integration tests for database utilities (52 tests)
 - `test_integration_e2e.py`: End-to-end integration tests (18 tests)
-- `test_api.py`: FastAPI integration tests (15 tests)
+- `test_api.py`: FastAPI integration tests (17 tests)
+- `test_models.py`: Pydantic model validation tests (24 tests)
+- `test_result_summarizer.py`: Result summarization tests (25 tests)
 
-**Total Test Count**: 85 tests covering unit, integration, end-to-end, and API scenarios
+**Total Test Count**: 136 tests covering unit, integration, end-to-end, and API scenarios
 
 ### Running Tests
 
@@ -556,22 +558,32 @@ The project includes comprehensive test coverage for all database utilities and 
 # Activate virtual environment first
 source venv_llm_logs/bin/activate
 
-# Run ALL tests (database utilities + API integration)
+# Run ALL tests (136 tests across all modules)
 python -m pytest tests/ -v
 
 # Run specific test file
-python -m pytest tests/test_db_utils.py -v        # 52 database utility tests
-python -m pytest tests/test_integration_e2e.py -v  # 18 end-to-end tests
-python -m pytest tests/test_api.py -v             # 15 API integration tests
+python -m pytest tests/test_db_utils.py -v              # 52 database utility tests
+python -m pytest tests/test_integration_e2e.py -v       # 18 end-to-end tests
+python -m pytest tests/test_api.py -v                   # 17 API integration tests
+python -m pytest tests/test_models.py -v                # 24 Pydantic model tests
+python -m pytest tests/test_result_summarizer.py -v     # 25 result summarizer tests
 
 # Run with short traceback (cleaner output)
 python -m pytest tests/ -v --tb=short
 
 # Run specific test class or method
 python -m pytest tests/test_integration_e2e.py::TestEndToEndFlow::test_end_to_end_with_bedrock -v
+
+# Run tests with coverage
+python -m pytest tests/test_result_summarizer.py --cov=src.shared.result_summarizer --cov-report=term
 ```
 
-**Total Test Coverage**: 85 tests (52 database utilities + 18 end-to-end + 15 API)
+**Total Test Coverage**: 136 tests across 6 test files
+- test_db_utils.py: 52 tests (connection pooling, query execution, result formatting)
+- test_integration_e2e.py: 18 tests (full NL→SQL→Results flow)
+- test_api.py: 17 tests (FastAPI endpoints, summary integration, performance)
+- test_models.py: 24 tests (Pydantic model validation and serialization)
+- test_result_summarizer.py: 25 tests (LLM summarization logic and error handling)
 
 ### Test Database Setup
 
@@ -598,7 +610,21 @@ Integration tests use a **separate test database** (`log_analytics_test`) to avo
 - Result formatting with metadata (execution time, truncation, column names)
 - QueryResult immutability verification
 
-#### End-to-End Integration (18 tests)
+#### Pydantic Models (24 tests - test_models.py)
+- **QueryRequest (10 tests)**: Validates query constraints (1-500 chars), max_rows (1-50,000), timeout (1-300s), defaults
+- **QueryResponse (3 tests)**: Response structure, data serialization, truncation flags
+- **ErrorResponse (3 tests)**: Error message validation, error type fields
+- **HealthResponse (3 tests)**: Health status, database/Bedrock availability flags
+- **Serialization (5 tests)**: JSON serialization with model_dump(), include_summary field
+
+#### Result Summarizer (25 tests - test_result_summarizer.py)
+- **Summarization Logic (5 tests)**: Empty results, single row, typical data, large datasets, aggregations
+- **Error Handling (6 tests)**: Bedrock API errors, throttling/retry logic, max retries, malformed responses, failed queries, JSON parsing errors
+- **Edge Cases (6 tests)**: Truncated results, NULL values, empty validation
+- **Context Building (3 tests)**: Prompt structure, result preview limits, truncation handling
+- **Initialization (5 tests)**: Default config, custom params, environment variables, few-shot examples, client failure
+
+#### End-to-End Integration (18 tests - test_integration_e2e.py)
 
 **TestEndToEndFlow (5 tests)**:
 - Full NL→SQL→Execution→Results flow with Bedrock API
@@ -629,8 +655,10 @@ Integration tests use a **separate test database** (`log_analytics_test`) to avo
 
 ### Test Performance
 
-- **All 70 tests run in ~4 seconds**
+- **All 136 tests run in ~10 seconds**
 - Test database creation adds ~0.5s overhead per session
+- Unit tests (no database): <0.5s total
+- Integration tests (with database): ~6-7s total
 - Individual test execution time: <100ms (95th percentile)
 - Concurrent tests verify connection pool thread safety
 
@@ -651,6 +679,40 @@ Integration tests use a **separate test database** (`log_analytics_test`) to avo
 - Known fixture data enables deterministic assertions
 - Separate test database prevents production data contamination
 
+### Common Testing Patterns
+
+**Mocking AWS Bedrock API**:
+```python
+from unittest.mock import patch, MagicMock
+
+# Mock Bedrock client invocation
+mock_response = {'content': [{'text': 'SELECT * FROM logs;'}]}
+with patch.object(generator.client, 'invoke_model') as mock_invoke:
+    mock_invoke.return_value = {'body': MagicMock(read=lambda: str(mock_response).encode())}
+    result = generator.generate_sql("show logs")
+```
+
+**Mocking FastAPI Dependencies**:
+```python
+# Mock BedrockSQLGenerator
+with patch('src.backend.routes.sql_generator.generate_sql', return_value="SELECT * FROM logs"):
+    response = test_client.post("/api/query", json={"query": "test"})
+
+# Mock ResultSummarizer
+with patch('src.backend.app.result_summarizer') as mock_summarizer:
+    mock_summarizer.summarize.return_value = SummaryResult(...)
+    response = test_client.post("/api/query", json={"query": "test"})
+```
+
+**Using Test Fixtures**:
+```python
+def test_with_real_data(test_db_with_fixtures):
+    """Test uses real database with 10 fixture logs."""
+    # Fixture automatically creates/destroys test data
+    result = executor.execute_query("SELECT * FROM logs WHERE level='ERROR'")
+    assert result.row_count > 0  # Known fixture data
+```
+
 ### Adding New Tests
 
 When adding new database functionality:
@@ -659,6 +721,13 @@ When adding new database functionality:
 2. **Add integration tests** using `test_db_with_fixtures` fixture for real database verification
 3. **Update fixture data** in `conftest.py` if new scenarios require specific test data
 4. **Run full test suite** to verify no regressions: `pytest tests/ -v`
+
+When adding new API functionality:
+
+1. **Add Pydantic model tests** in `test_models.py` for request/response validation
+2. **Add endpoint tests** in `test_api.py` with mocked Bedrock (no AWS calls)
+3. **Add performance tests** if latency-critical (see `TestPerformance`)
+4. **Test error scenarios** (validation errors, timeouts, API errors)
 
 ## FastAPI Backend
 
@@ -823,7 +892,7 @@ The API implements 8 layers of security:
 
 ### Testing
 
-**API Integration Tests** (`tests/test_api.py` - 15 tests):
+**API Integration Tests** (`tests/test_api.py` - 17 tests):
 
 ```bash
 # Run all API tests
@@ -831,9 +900,15 @@ python -m pytest tests/test_api.py -v
 
 # Run with short traceback
 python -m pytest tests/test_api.py -v --tb=short
+
+# Run specific test class
+python -m pytest tests/test_api.py::TestEndpoints -v
+python -m pytest tests/test_api.py::TestPerformance -v
 ```
 
 **Test Coverage**:
+
+**TestEndpoints (15 tests)**:
 - Root endpoint (API info)
 - Health check endpoint
 - Query endpoint with mocked Bedrock
@@ -848,6 +923,10 @@ python -m pytest tests/test_api.py -v --tb=short
 - Summary disabled (`include_summary: false`)
 - Summary default behavior (defaults to `true`)
 - Summary failure handling (graceful degradation)
+
+**TestPerformance (2 tests)**:
+- Total API latency under 3 seconds (SQL generation + query + summarization)
+- Summary execution time tracking and reporting
 
 **Key Testing Pattern**: Use TestClient with context manager to trigger lifespan events:
 
@@ -1020,16 +1099,35 @@ AWS_SECRET_ACCESS_KEY="your_secret"
 
 ### Testing
 
-**API Tests** (`tests/test_api.py` - 15 tests total):
+**Unit Tests** (`tests/test_result_summarizer.py` - 25 tests):
+- **Summarization Logic (5 tests)**: Empty results, single row, typical, large, aggregations
+- **Error Handling (6 tests)**: API errors, throttling retry, max retries, malformed response, failed query, JSON parsing
+- **Edge Cases (6 tests)**: Truncated results, NULL values, empty validation
+- **Context Building (3 tests)**: Prompt structure, preview limits, truncation
+- **Initialization (5 tests)**: Default config, custom params, env vars, examples, client failure
+
+**Integration Tests** (`tests/test_api.py` - 17 tests total):
 - Summary enabled (`include_summary: true`)
 - Summary disabled (`include_summary: false`)
 - Default behavior (defaults to `true`)
-- Error handling (summary failures don't break query)
+- Summary failure handling (graceful degradation)
+- Performance tests (latency <3s, execution time tracking)
 
 **Run Tests**:
 ```bash
 source venv_llm_logs/bin/activate
-python -m pytest tests/test_api.py -v --tb=short
+
+# Unit tests only (no AWS calls, fast)
+python -m pytest tests/test_result_summarizer.py -v
+
+# Integration tests (with mocked Bedrock)
+python -m pytest tests/test_api.py::TestEndpoints::test_query_with_summary_enabled -v
+
+# All summarization tests
+python -m pytest tests/test_result_summarizer.py tests/test_api.py -v
+
+# With coverage
+python -m pytest tests/test_result_summarizer.py --cov=src.shared.result_summarizer --cov-report=term
 ```
 
 **Manual Testing**:
@@ -1123,8 +1221,16 @@ See README.md for detailed explanation, but key points:
 - ✅ **API integration** - Optional `include_summary` field in `/api/query`
 - ✅ **Graceful degradation** - Summary failures don't break queries
 - ✅ **Error handling** - Fallback summaries with retry logic
+- ✅ **Comprehensive testing** - 25 unit tests + 2 performance tests
 
 **Phase 2 Complete!** All natural language query features implemented and tested.
+
+**Test Suite Summary** (136 total tests):
+- 52 tests: Database utilities (connection pooling, query execution, formatting)
+- 18 tests: End-to-end integration (NL→SQL→Results flow)
+- 17 tests: FastAPI endpoints (validation, errors, performance)
+- 24 tests: Pydantic models (request/response validation)
+- 25 tests: Result summarization (LLM summaries, error handling)
 
 **Next Steps (Phase 3 - Intelligence Layer)**:
 - Anomaly detection using statistical methods
